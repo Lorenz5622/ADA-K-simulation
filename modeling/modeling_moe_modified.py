@@ -24,7 +24,7 @@ import torch
 import torch.utils.checkpoint
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
-import json
+from transformers import AutoTokenizer
 
 from transformers import PreTrainedModel
 from transformers.activations import ACT2FN
@@ -33,11 +33,21 @@ from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import logging, add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
 
 from .configuration_moe import MoEConfig
-
+from transformers.generation.utils import GenerationMixin, GenerationConfig
+from transformers.generation.logits_process import (
+        LogitsProcessorList,
+        RepetitionPenaltyLogitsProcessor,
+        NoRepeatNGramLogitsProcessor,
+        MinLengthLogitsProcessor,
+    )
+from transformers.generation.stopping_criteria import StoppingCriteriaList, MaxLengthCriteria
+from transformers.generation.logits_process import TopPLogitsWarper
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
 
+# model_path = '/mnt/data/models/Dynamic_moe'
+# tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -222,7 +232,7 @@ class SwitchMLP(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
         topk_ind = topk_ind.view(-1, topk_ind.size(2))
-
+        # print(topk_ind)
         output_total = torch.zeros_like(hidden_states).to(hidden_states)
         for expert_num, expert in enumerate(self.experts):
             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
@@ -385,7 +395,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-        print("DecoderLayer.forward(): outputs", outputs)
+
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -571,6 +581,15 @@ class MoEModel(MoEPreTrainedModel):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        
+        # 记录每一层的输出
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.setLevel(logging.INFO)
+        handler = logging.FileHandler("layer_outputs.log")
+        formatter = logging.Formatter('%(asctime)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
 
         # retrieve input_ids and inputs_embeds
         if input_ids is not None and inputs_embeds is not None:
@@ -623,6 +642,9 @@ class MoEModel(MoEPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        # 在 decoder layer 循环中插入日志记录
+        all_layer_tokens = []  # 存储每层的 token 输出
+
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -657,6 +679,16 @@ class MoEModel(MoEPreTrainedModel):
 
             hidden_states = layer_outputs[0]
 
+            # 开始记录每一层的输出
+            # logits = self.norm(hidden_states)  # 先 normalize
+            # logits = self.lm_head(logits)     # 推过 lm_head 得到 vocab 分布
+            # next_token_logits = logits[:, -1, :]  # 只取最后一个 token 的 logits
+            # next_token_id = torch.argmax(next_token_logits, dim=-1)
+
+            # decoded_token = tokenizer.decode(next_token_id.tolist()[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            # logger.info(f"Layer {idx}: Token: {decoded_token} | ID: {next_token_id.item()}")
+            # all_layer_tokens.append(decoded_token)
+
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
 
@@ -665,12 +697,12 @@ class MoEModel(MoEPreTrainedModel):
 
         hidden_states = self.norm(hidden_states)
 
+
+
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        print("MoEModel.forward(): hidden_states : ", hidden_states)
-        print("MoEModel.forward(): past_key_values : ", past_key_values)
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -681,14 +713,16 @@ class MoEModel(MoEPreTrainedModel):
             attentions=all_self_attns,
         )
 
-class MoEForCausalLM(MoEPreTrainedModel):
+class MoEForCausalLM(MoEPreTrainedModel, GenerationMixin):
     def __init__(self, config):
         super().__init__(config)
         self.model = MoEModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+        # 加载 tokenizer 以支持解码
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained("/mnt/data/models/Dynamic_moe", use_fast=False)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -709,6 +743,24 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+    
+    
+    def get_logits_processor(self, **kwargs):
+        processors = LogitsProcessorList()
+
+        if kwargs.get("repetition_penalty") is not None and kwargs["repetition_penalty"] > 1.0:
+            processors.append(RepetitionPenaltyLogitsProcessor(kwargs["repetition_penalty"]))
+        if kwargs.get("no_repeat_ngram_size") is not None and kwargs["no_repeat_ngram_size"] > 0:
+            processors.append(NoRepeatNGramLogitsProcessor(kwargs["no_repeat_ngram_size"]))
+        if kwargs.get("min_length") is not None and kwargs["min_length"] > 0:
+            processors.append(MinLengthLogitsProcessor(kwargs["min_length"], kwargs["eos_token_id"]))
+        return processors
+    
+    def get_stopping_criteria(self, max_length: Optional[int] = None) -> StoppingCriteriaList:
+        criteria = StoppingCriteriaList()
+        if max_length is not None:
+            criteria.append(MaxLengthCriteria(max_length=max_length))
+        return criteria
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -769,13 +821,184 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
-        # 传过来的是 MoEModel.forward(): hidden_states
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
-        print("logits: ", logits)
 
+        # logits_processor = LogitsProcessorList([
+        # TopPLogitsWarper(top_p=0.9, min_tokens_to_keep=1)
+        # ])
+        # processed_logits = logits_processor(input_ids, logits)
+        # print("Processed logits:", processed_logits)
+        # print("Shape:", processed_logits.shape)
+        # print("Min/Max token ID:", processed_logits.min(), processed_logits.max())
+        # word = self.tokenizer.decode(processed_logits, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        # print("next token : ", word)
+
+        next_token_logits = logits[:, -1, :]  # shape: (batch_size, vocab_size)
+
+        # # 使用 Top-p 采样获取下一个 token ID
+        # next_token_id = top_p_sampling_single_token(next_token_logits, top_p=0.9, temperature=1.0)
         
+        # if(next_token_id.shape[1] == 1):
+        # # 打印/解码 token
+        #     token = self.tokenizer.decode(next_token_id[0].item(), skip_special_tokens=True)
+        #     print("Next token:", token)
+
+        logits_processor = LogitsProcessorList([
+            TopPLogitsWarper(top_p=0.9),
+            # RepetitionPenaltyLogitsProcessor(penalty=1.2),
+        ])
+        processed_logits = logits_processor(input_ids, next_token_logits)
+        # 采样
+        probs = torch.softmax(processed_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        # 更新 input_ids
+        input_ids = torch.cat([input_ids, next_token], dim=-1)
+
+        # 解码并打印
+        token = self.tokenizer.decode(next_token[0], skip_special_tokens=True)
+        print("Decoded Token:", token)
+        # if(processed_logits.shape[1] == 1):
+        # # 打印/解码 token
+        #     token = self.tokenizer.decode(processed_logits[0].item(), skip_special_tokens=True)
+        #     print("Next token:", next_tokens)
+
+        # 魔方top-p采样
+        # top_p = 0.9
+        # min_tokens_to_keep = 1
+
+        # sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+        # cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
+
+        # # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+        # sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+        # # Keep at least min_tokens_to_keep
+        # sorted_indices_to_remove[..., -min_tokens_to_keep :] = 0
+
+        # # scatter sorted tensors to original indexing
+        # indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        # scores_processed = logits.masked_fill(indices_to_remove, -float("Inf"))
+
+        # word = self.tokenizer.decode(scores_processed, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        # print("next token : ", word)
+
+        # if not self.training and logits is not None:
+        #     next_token_logits = logits[:, -1, :]  # shape: (batch_size, vocab_size)
+
+        # from transformers import GenerationConfig
+        # gen_config = GenerationConfig.from_model_config(self.config)
+
+        # # 创建 logits processor
+        # logits_processor = self.get_logits_processor(
+        #     repetition_penalty=1.0,
+        #     no_repeat_ngram_size=0,
+        #     min_length=0,
+        #     eos_token_id=gen_config.eos_token_id,
+        #     num_beams=1,
+        # )
+
+        # # 创建 stopping criteria
+        # stopping_criteria = self.get_stopping_criteria(max_length=gen_config.max_length)
+
+        # # 调用 _sample 方法进行采样
+        # next_tokens = self._sample(
+        #     input_ids=input_ids,
+        #     logits=next_token_logits,
+        #     logits_processor=logits_processor,
+        #     stopping_criteria=stopping_criteria,
+        #     synced_gpus=False,
+        #     streamer=None,
+        #     generation_config=gen_config,
+        # )
+
+        # # 打印 token id 和解码结果
+        # decoded_tokens = [
+        #     self.tokenizer.decode([token_id.item()], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #     for token_id in next_tokens
+        # ]
+        # for i, token in enumerate(decoded_tokens):
+        #     print(f"[Batch {i}] Generated Token: '{token}' | ID: {next_tokens[i].item()}")
+
+        # # 记录当前预测 token
+        # next_token_logits = logits[:, -1, :]
+        # next_token_id = torch.argmax(next_token_logits, dim=-1)
+        # decoded_token = tokenizer.decode(next_token_id.item(), skip_special_tokens=True)
+        # logger.info(f"Generated Token: {decoded_token} | ID: {next_token_id.item()}")
+
+
+        # # ========== 新增：使用 GenerationMixin 的 _sample 方法 ==========
+        # if not self.training:
+        #     next_token_logits = logits[:, -1, :]  # shape: (batch_size, vocab_size)
+
+        #     # 获取当前 past_key_values
+        #     past_key_values = outputs.past_key_values
+
+        #     # 构造 input_ids（用于 repetition_penalty）
+        #     current_input_ids = input_ids if input_ids is not None else inputs_embeds
+
+        #     gen_config = GenerationConfig(
+        #         max_length=256,
+        #         repetition_penalty=1.0,
+        #         no_repeat_ngram_size=0,
+        #         min_length=0,
+        #         eos_token_id=self.config.eos_token_id,
+        #         pad_token_id=self.config.pad_token_id,
+        #         num_beams=1,
+        #         do_sample=True,  # 明确启用采样
+        #     )
+
+        #     # gen_config = GenerationConfig.from_model_config(self.config)
+        #     # gen_config.repetition_penalty = 1.0
+        #     # gen_config.no_repeat_ngram_size = 0
+        #     # gen_config.min_length = 0
+        #     # gen_config.eos_token_id = self.config.eos_token_id
+        #     # gen_config.pad_token_id = self.config.pad_token_id
+
+        #     # 使用 HuggingFace 内部的 _sample 方法进行采样
+        #     next_tokens = self._sample(
+        #         input_ids=current_input_ids,
+        #         logits=next_token_logits,
+        #         logits_processor = self.get_logits_processor(
+        #             repetition_penalty=1.0,
+        #             no_repeat_ngram_size=0,
+        #             min_length=0,
+        #             eos_token_id=self.config.eos_token_id,
+        #             num_beams=1,
+        #         ),
+        #         stopping_criteria=self.get_stopping_criteria(max_length=256),
+        #         synced_gpus=False,
+        #         streamer=None,
+        #         generation_config=gen_config,
+        #     )
+
+        #     decoded_tokens = [self.tokenizer.decode([t.item()], skip_special_tokens=True) for t in next_tokens]
+        #     print("Decoded Tokens:", decoded_tokens)
+        # # ===================================================
+
+        # ==============================
+        # 🔍 新增：实时解码当前 token
+        # ==============================
+        # if not self.training and logits is not None:
+        #     # 获取最后一个 token 的 logits
+        #     next_token_logits = logits[:, -1, :]  # shape: (batch_size, vocab_size)
+        #     next_token_ids = torch.argmax(next_token_logits, dim=-1)  # shape: (batch_size,)
+
+        #     # 批量解码
+        #     decoded_tokens = [
+        #         self.tokenizer.decode([token_id.item()], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #         for token_id in next_token_ids
+        #     ]
+
+        #     # 打印日志
+        #     for i, token in enumerate(decoded_tokens):
+        #         print(f"[Batch {i}] Generated Token: '{token}' | ID: {next_token_ids[i].item()}")
+
+        # # ==============================
+        # # ✅ 原有 loss 计算逻辑保持不变
+        # # ==============================
+
 
         loss = None
         if labels is not None:
@@ -801,13 +1024,20 @@ class MoEForCausalLM(MoEPreTrainedModel):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+    
+    
 
     def prepare_inputs_for_generation(
         self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs
     ):
         if past_key_values:
             input_ids = input_ids[:, -1:]
-
+        
+        # word = self.tokenizer.decode(input_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        # print("next token : ", word)
+        # if(input_ids.shape[1] == 1):
+        #     word = self.tokenizer.decode(input_ids[0], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        #     print("next token : ", word)
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -855,73 +1085,65 @@ class MoEForCausalLM(MoEPreTrainedModel):
     LLAMA_START_DOCSTRING,
 )
 
-def checkTokenFromLogits(logits, input_ids):
-    import torch
-    from transformers import AutoTokenizer, LogitsProcessorList, TopPLogitsWarper, LogitsWarper, TopKLogitsWarper
-    
-    # Step 1: 只取最后一个 token 对应的 logits，shape: (1, 32000)
-    next_token_logits = logits[:, -1, :]
-    saveTensorToJson(next_token_logits, "next_token_logits.json")
+def top_p_sampling_single_token(logits: torch.FloatTensor, top_p=0.9, temperature=1.0, min_tokens_to_keep = 1, filter_value: float = -float("Inf"),):
+    """
+    对单个 token 的 logits 进行 Top-p 采样，返回一个 token ID
+    :param logits: shape (batch_size, vocab_size)
+    :param top_p: 累计概率阈值
+    :param temperature: 温度缩放
+    :return: tensor of shape (batch_size, 1)
+    """
+    logits = logits / temperature
+    probs = torch.softmax(logits, dim=-1)
 
-    # Step 2: 设置 Logits 处理器（Top-p + Temperature）
-    logits_processor = LogitsProcessorList([
-        TopKLogitsWarper(top_k=50),
-        TopPLogitsWarper(top_p=0.9),
-    ])
-    
-    processed_logits = next_token_logits
-    print("next_token_scores : ", processed_logits)
-    # Step 4: 应用处理器（Top-p）
-    processed_logits = logits_processor(input_ids, next_token_logits)
-    saveTensorToJson(processed_logits, "processed_logits.json")
-    print("input_ids : ", input_ids)
-    # 找出不是 -inf 的元素的布尔掩码
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
 
-    not_inf_mask = torch.isfinite(processed_logits)  # 检查是否是有限数（既不是 inf 也不是 -inf）
+    # 移除累计概率超过 top_p 的 token
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 0] = 0  # 至少保留一个 token
 
-    # 获取非 -inf 元素的索引
-    values = processed_logits[not_inf_mask].tolist()
+    probs_masked = probs.masked_fill(sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove), 0)
+    probs_masked = probs_masked / probs_masked.sum(dim=-1, keepdim=True)  # 重新归一化
 
-    print("非 -inf 的值:", values)
+    next_token_id = torch.multinomial(probs_masked, num_samples=1)  # shape: (batch_size, 1)
+    return next_token_id
+    # sorted_logits, sorted_indices = torch.sort(logits, descending=False)
+    # cumulative_probs = sorted_logits.softmax(dim=-1).cumsum(dim=-1)
 
-    # Step 5: 转换为概率分布并采样
-    probs = nn.functional.softmax(processed_logits, dim=-1)
-    saveTensorToJson(probs, "probs.json")
-    # 检查是否是有限数（既不是 inf 也不是 -inf）
-    # 将张量移动到CPU以便处理
-    probs_cpu = probs.cpu()
-    # 创建布尔掩码，过滤掉 inf 和 -inf 的值
-    finite_mask = torch.isfinite(probs_cpu)
-    # 创建布尔掩码，过滤掉 0 的值
-    non_zero_mask = probs_cpu != 0.0
-    # 结合两个掩码
-    valid_mask = finite_mask & non_zero_mask
-    # 提取符合条件的值
-    valid_values = probs_cpu[valid_mask].tolist()
+    # # Remove tokens with cumulative top_p above the threshold (token with 0 are kept)
+    # sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
+    # # Keep at least min_tokens_to_keep
+    # sorted_indices_to_remove[..., -min_tokens_to_keep :] = 0
 
-    print("非 0 的值:", valid_values)
-    valid_indices = torch.nonzero(valid_mask, as_tuple=True)[1].tolist()  # 获取非零位置的列索引
-    
-    print("非 0 的值索引:", valid_indices)
+    # # scatter sorted tensors to original indexing
+    # indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+    # scores_processed = logits.masked_fill(indices_to_remove, filter_value)
+    # return scores_processed
 
-    next_token_id = torch.multinomial(probs, num_samples=1).squeeze(1)
-    saveTensorToJson(next_token_id, "next_token_id.json")
+# def top_p_sampling_single_token(logits, top_p=0.9, temperature=1.0):
+#     """
+#     对单个 token 的 logits 进行 Top-p 采样
+#     :param logits: shape (batch_size, vocab_size)
+#     :param top_p: 累计概率阈值
+#     :param temperature: 温度缩放
+#     :return: 过滤后的 logits（用于采样）
+#     """
+#     logits = logits / temperature
+#     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 
-    print("next_tokens : ",next_token_id)
-    unfinished_sequences = torch.ones(1, dtype=torch.long, device=input_ids.device)
-    next_token_id = next_token_id * unfinished_sequences + 0 * (1 - unfinished_sequences)
+#     cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+#     sorted_indices_to_remove = cumulative_probs > top_p
+#     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+#     sorted_indices_to_remove[..., 0] = 0
 
-    # Step 6: 加载 Tokenizer 并解码
-    tokenizer = AutoTokenizer.from_pretrained("/mnt/data/models/Dynamic_moe", use_fast=False)  # 替换为你的 tokenizer 路径
-    token = tokenizer.decode(next_token_id, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+#     indices_to_remove = sorted_indices_to_remove.scatter(dim=1, index=sorted_indices, src=sorted_indices_to_remove)
 
-    # print("Next Token ID:", next_token_id.item())
-    print( "self-defined token: ", token)
+#     logits = logits.masked_fill(indices_to_remove, float('-inf'))
+#     return logits
 
-def saveTensorToJson(tensor, path):
-    path = '/root/' + path
-    with open(path, 'w') as f:
-        json.dump(tensor.tolist(), f)
+
 
 
 class LlamaForSequenceClassification(MoEPreTrainedModel):
