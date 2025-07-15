@@ -783,7 +783,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         logits = self.lm_head(hidden_states)
         print(logits.shape)
 
-        if(logits)
+        # if(logits)
 
         loss = None
         if labels is not None:
