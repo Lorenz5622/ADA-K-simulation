@@ -44,7 +44,7 @@ import torch
 from Dynamic_MoE.modeling.modeling_moe import MoEForCausalLM
 from Dynamic_MoE.modeling.configuration_moe import MoEConfig
 import json
-
+import torch.nn.functional as F
 
 def generate(tokenizer, model, text):
     inputs = [text]
@@ -134,13 +134,29 @@ if __name__ == "__main__":
             print("Correct Answer Index:", correct_index)
             response = generate(tokenizer, model, prompt)
 
+            torch.save(model.saved_logits, "saved_logits.pt")
+            print("Logits saved to 'saved_logits.pt'")
+            print(f"Total generated steps: {len(model.saved_logits)}")
+            print(f"logits shape = {model.saved_logits[-1].shape}")
+            label_id = line_label.strip()  # 去除换行符并转换为整数
+            label_token = tokenizer.encode(label_id, return_tensors="pt")
+            vector = torch.zeros(1, 1, 32000)
+            # 将第 x 位设为 1
+            target_token_id = label_token[0, 2].unsqueeze(0).cuda()
+            logits = model.saved_logits[-1].squeeze(1)
+            loss = F.cross_entropy(logits, target_token_id)
+
+            # 打印损失值
+            print("Cross Entropy Loss:", loss.item())
+            
             answer_id = 0
             for i in range(len(response)):
                 if response[i] == '0' or response[i] == '1' or response[i] == '2':
                     answer_id = response[i]
                 
-            print("Answer is: "+ str(answer_id))
+            print(f"Answer is: {answer_id}, with right ans is {label_id}")
             print('-' * 60)
+            
 
 
     

@@ -695,7 +695,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         super().__init__(config)
         self.model = MoEModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
+        self.saved_logits = []
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -783,7 +783,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
         logits = self.lm_head(hidden_states)
         print(logits.shape)
 
-        # if(logits)
+        if logits.dim() == 3:
+            if logits.size(1) > 1:  # 第一次生成
+                self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token
+            else:
+                self.saved_logits.append(logits)  # 后续每个都直接保存
+        print(len(self.saved_logits))
 
         loss = None
         if labels is not None:
