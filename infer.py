@@ -62,7 +62,25 @@ def generate(tokenizer, model, text):
     response_ids = generate_ids[:, input_ids.shape[1]:]
     return response, response_ids
     
-    
+def find_pattern(output_ids):
+    # 定义目标模式
+    pattern_1 = [673, 29901]
+    candidates = [29909, 29933, 29907]
+
+    # 转换为 tensor 方便处理
+    output_ids = output_ids.view(-1)  # 确保是一维
+
+    found_positions = []
+
+    for i in range(len(output_ids) - len(pattern_1)):
+        # 检查是否匹配前两个 token: [673, 29901]
+        if output_ids[i:i+2].tolist() == pattern_1:
+            # 检查下一个 token 是否是候选之一
+            next_token = output_ids[i+2].item()
+            if next_token in candidates:
+                found_positions.append((i+2, next_token))  # 记录位置和具体哪个 token
+
+    return found_positions
 
 if __name__ == "__main__":
     model_path = '/home/cyx/models/Dynamic_MoE'
@@ -168,8 +186,10 @@ if __name__ == "__main__":
             """
             # 打印或处理这些数据（例如构建模型输入）
             print(prompt)
-            response, output_ids = generate(tokenizer, model, prompt)
+            response, output_ids = generate(tokenizer, model, prompt) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
+            # 强行匹配，如果有answer:A B C 才进入后续处理，否则跳过。使用对应的id进行匹配
             print("Generated Response:", response)
+            
             answer_id = None
             gen_logits = None
             if "Answer:A" in response or "Answer:B" in response or "Answer:C" in response:
