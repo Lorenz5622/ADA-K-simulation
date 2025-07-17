@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
 from mpl_toolkits.mplot3d import Axes3D
-
+import torch.nn.functional
 DNA_SIZE = 24
 POP_SIZE = 80
 CROSSOVER_RATE = 0.6
@@ -11,7 +11,16 @@ N_GENERATIONS = 100
 X_BOUND = [-2.048, 2.048]
 Y_BOUND = [-2.048, 2.048]
 
-
+class GeneticAlgorithm:
+    def __init__(self, pop_size, length):
+        self.DNA_size = length
+        self.POP_size = pop_size
+        self.pop = np.random.randint(2, size=(self.POP_size, self.DNA_size))
+    
+    def F(self, x, label):
+        return torch.nn.functional.cross_entropy(x, label)
+    
+    def 
 def F(x, y):
     return 100.0 * (y - x ** 2.0) ** 2.0 + (1 - x) ** 2.0  # 以香蕉函数为例
 
@@ -68,10 +77,10 @@ def print_info(pop):
     print("(x, y):", (x[max_fitness_index], y[max_fitness_index]))
     print(F(x[max_fitness_index], y[max_fitness_index]))
 
-def init_pop(size, length):
-    global POP_SIZE, DNA_SIZE
-    POP_SIZE = size
-    DNA_SIZE = length
+# def init_pop(expert_size, expert_len):
+#     global POP_SIZE, DNA_SIZE
+#     POP_SIZE = size
+#     DNA_SIZE = length
     
 
 

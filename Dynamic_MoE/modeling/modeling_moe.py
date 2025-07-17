@@ -781,14 +781,14 @@ class MoEForCausalLM(MoEPreTrainedModel):
         # print(dynamic_k)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        print(logits.shape)
+        # print(logits.shape)
 
         if logits.dim() == 3:
             if logits.size(1) > 1:  # 第一次生成
                 self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token
             else:
                 self.saved_logits.append(logits)  # 后续每个都直接保存
-        print(len(self.saved_logits))
+        # print(len(self.saved_logits))
 
         loss = None
         if labels is not None:
@@ -820,7 +820,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
     ):
         if past_key_values:
             input_ids = input_ids[:, -1:]
-        print(f"input_ids: {input_ids}")
+        # print(f"input_ids: {input_ids}")
         position_ids = kwargs.get("position_ids", None)
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation

@@ -78,7 +78,8 @@ def find_pattern(output_ids):
             # 检查下一个 token 是否是候选之一
             next_token = output_ids[i+2].item()
             if next_token in candidates:
-                found_positions.append((i+2, next_token))  # 记录位置和具体哪个 token
+                found_positions.append(i+2)  # 记录位置和具体哪个 token
+                break
 
     return found_positions
 
@@ -182,46 +183,51 @@ if __name__ == "__main__":
                 - A: {data['answerA']}
                 - B: {data['answerB']}
                 - C: {data['answerC']}
-                <BOT>: 
-            """
+                <BOT>: """
             # 打印或处理这些数据（例如构建模型输入）
-            print(prompt)
+            # print(prompt)
             response, output_ids = generate(tokenizer, model, prompt) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
             # 强行匹配，如果有answer:A B C 才进入后续处理，否则跳过。使用对应的id进行匹配
             print("Generated Response:", response)
-            
-            answer_id = None
-            gen_logits = None
-            if "Answer:A" in response or "Answer:B" in response or "Answer:C" in response:
-                print("------enter processing------------")
-                response = response.split()
-                for i in range(len(response)):
-                    if response[i] == '0' or response[i] == '1' or response[i] == '2':
-                        answer_id = response[i]
-                        gen_logits = model.saved_logits[i]
-                        break
-
-            
+            ans_pos = find_pattern(output_ids)
             torch.save(model.saved_logits, "saved_logits.pt")
             print("Logits saved to 'saved_logits.pt'")
-            # print(f"Total generated steps: {len(model.saved_logits)}")
-            # print(f"logits shape = {model.saved_logits[-1].shape}")
-            label_id = line_label.strip()  # 去除换行符并转换为整数
-            label_token = tokenizer.encode(label_id, return_tensors="pt")
-            vector = torch.zeros(1, 1, 32000)
-            # 将第 x 位设为 1
+            
+            # 判断是否正确输出并处理answer_id
+            if len(ans_pos) == 1:
+                answer_id = output_ids[0, ans_pos[0]]
+                gen_logits = model.saved_logits[ans_pos[0]].squeeze(1)
+                
+                # 处理label_id
+                label_id = line_label.strip()  # 去除换行符并转换为整数
+                # TODO 把label_id转为A B C
+                label_id = chr(ord('A')+int(label_id-1))
+                print(f"Answer is: {answer_id}, with right ans is {label_id}")
+                label_token = tokenizer.encode(label_id, return_tensors="pt")
+                token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
+                target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
 
-            if gen_logits is not None:
-                target_token_id = label_token[0, 2].unsqueeze(0).cuda()
-                gen_logits = gen_logits.squeeze(1)
                 loss = F.cross_entropy(gen_logits, target_token_id)
-
                 # 打印损失值
                 print("Cross Entropy Loss:", loss.item())
+            # answer_id = None
+            # gen_logits = None
+
+            # if "Answer:A" in response or "Answer:B" in response or "Answer:C" in response:
+            #     print("------enter processing------------")
+            #     response = response.split()
+            #     for i in range(len(response)):
+            #         if response[i] == '0' or response[i] == '1' or response[i] == '2':
+            #             answer_id = response[i]
+            #             gen_logits = model.saved_logits[i]
+            #             break
+
             
             
+            # print(f"Total generated steps: {len(model.saved_logits)}")
+            # print(f"logits shape = {model.saved_logits[-1].shape}")    
             model.saved_logits = []
-            print(f"Answer is: {answer_id}, with right ans is {label_id}")
+            
             print('-' * 60)
             
 
