@@ -1,52 +1,17 @@
-# from transformers import AutoTokenizer
-# import torch
-# from modeling.modeling_moe_ori import MoEForCausalLM
-# from modeling.configuration_moe import MoEConfig
-
-
-
-# def generate(tokenizer, model, text):
-#     inputs = [text]
-#     tokens = tokenizer(inputs,return_tensors="pt")
-#     input_ids = tokens.input_ids.cuda()
-#     generate_ids = model.generate(inputs=input_ids,
-#                 num_beams=1, 
-#                 bos_token_id=tokenizer.bos_token_id,
-#                 eos_token_id=tokenizer.eos_token_id,
-#                 pad_token_id=tokenizer.pad_token_id,
-#                 max_new_tokens=256, top_p=0.9, temperature=1.0, do_sample=True)
-#     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-#     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
-#     return response
-    
-
-# if __name__ == "__main__":
-#     model_path = '/mnt/data/models/Dynamic_moe'
-#     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
-#     tokenizer.pad_token = tokenizer.unk_token
-
-#     model_config = MoEConfig.from_pretrained(model_path,trust_remote_code=True)
-#     model = MoEForCausalLM.from_pretrained(
-#         model_path,
-#         from_tf=False,
-#         config=model_config,
-#         torch_dtype=torch.bfloat16,
-#         low_cpu_mem_usage=True
-#     ).cuda()
-#     model.eval() 
-
-#     response = generate(tokenizer, model, 'The highest mountain in the world is')
-#     print("------------------true output------------------")
-#     print(response)
-    
 from transformers import AutoTokenizer
 import torch
 from Dynamic_MoE.modeling.modeling_moe import MoEForCausalLM
 from Dynamic_MoE.modeling.configuration_moe import MoEConfig
 import json
 import torch.nn.functional as F
+import random
+from Dynamic_MoE.rl.rl import GeneticAlgorithm
+import numpy as np
 
-def generate(tokenizer, model, text):
+N_GENERATIONS = 20
+CROSSOVER_RATE = 0.6
+MUTATION_RATE = 0.01
+def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
     input_ids = tokens.input_ids.cuda()
@@ -55,7 +20,7 @@ def generate(tokenizer, model, text):
                 bos_token_id=tokenizer.bos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
-                dynamic_k=[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+                dynamic_k=dynamic_k,
                 max_new_tokens=32,top_p=0.9, temperature=1.0, do_sample=True)
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
@@ -84,7 +49,7 @@ def find_pattern(output_ids):
     return found_positions
 
 if __name__ == "__main__":
-    model_path = '/home/cyx/models/Dynamic_MoE'
+    model_path = '/root/models/Dynamic_MoE'
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -98,66 +63,28 @@ if __name__ == "__main__":
     ).cuda()
     model.eval()
 
-    file_json = '/home/cyx/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
-    file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
+    file_json = '/root/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
+    file_label = '/root/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
 
-
+    ga = GeneticAlgorithm(20, 16*3) # 16代表有16层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
+    pop = ga.pop
+    for _ in range(N_GENERATIONS):  # 迭代N代
+        expert_list = ga.translateDNA()
+        print(f"new pop is:\n {expert_list}")
+        pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
+        fitness = ga.get_fitness(np.random.randint(low=1, high=11, size=ga.POP_size))
+        pop = ga.select()  # 选择生成新的种群
+        # TODO 将生成的expert_list在数据集中测试，每个个体成功测试10次取logits平均值。损失加上使用的专家数目（要考虑权重）
     with open(file_json, 'r', encoding='utf-8') as fj, \
         open(file_label, 'r', encoding='utf-8') as fl:
+        data_pairs = list(zip(fj.readlines(), fl.readlines()))
+        # 打乱顺序
+        random.shuffle(data_pairs)
 
-        for line_json, line_label in zip(fj, fl):
+        for line_json, line_label in data_pairs:
             # 解析 JSON 行
             data = json.loads(line_json.strip())
-            
-            # 获取 context 和 question
-            # context = "Context: "+ data['context'] + "\n"
-            # question = "Question:" + data['question'] + "\n"
-            # answers = [data['answerA'], data['answerB'], data['answerC']]
-            # answer = "Answers: " + "0." + data['answerA'] + "\n" + "1. " + data['answerB'] + "\n" + "2. " + data['answerC'] + "\n"
-            
-            # 获取正确标签（转换为整数）
             correct_index = int(line_label.strip())
-
-            # prompt = "Read the given context and Question, select the right answer from the three given answers. You should only output one of the three labels: answerA, answerB, answer C." + context + question + answer
-            # prompt = """
-            # Here is several Examples, you should read the Context and answer the question from given options, you dhould only output one of the three options: 1, 2, 3.
-            
-            # Example 1:
-            # Context: Since they were the teacher and needed to make things clear, Kendall proved every point.
-            # Question: What will Kendall want to do next?
-            # Options:
-            # 1. avoid confusion
-            # 2. make things tough to get
-            # 3. make sure students understand
-            # The right answer is: 3
-
-            # Example 2:
-            # Context: Remy got a new puppy today and taught him how to sit.
-            # Question: How would Remy feel afterwards?
-            # Options:
-            # 1. happy
-            # 2. sad
-            # 3. A pet owner who cares about their dog
-            # The right answer is: 0
-
-            # Example 3:
-            # Context: Remy got a new puppy today and taught him how to sit.
-            # Question: How would Remy feel afterwards?
-            # Options:
-            # 1. happy
-            # 2. sad
-            # 3. A pet owner who cares about their dog
-            # The right answer is: 0
-            
-            # Now please answer the following question in the same format.
-            # Context:{context}
-            # Question:{question}
-            # Options:
-            # 1. {a0}
-            # 2. {a1}
-            # 3. {a2}
-            # The right answer is:
-            # """.format(context=context, question=question, a0=answers[0], a1=answers[1], a2=answers[2])
             prompt = f"""
                 Meta instruction: You are now a helpful and harmless AI assistant. <HUMAN> will give the context and question, choose the most appropriate answer from the options provided. Answer with only the option label (e.g., A, B or C).
 
@@ -186,7 +113,8 @@ if __name__ == "__main__":
                 <BOT>: """
             # 打印或处理这些数据（例如构建模型输入）
             # print(prompt)
-            response, output_ids = generate(tokenizer, model, prompt) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
+            dynamic_k = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
+            response, output_ids = generate(tokenizer, model, prompt, dynamic_k) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
             # 强行匹配，如果有answer:A B C 才进入后续处理，否则跳过。使用对应的id进行匹配
             print("Generated Response:", response)
             ans_pos = find_pattern(output_ids)
@@ -199,7 +127,7 @@ if __name__ == "__main__":
                 gen_logits = model.saved_logits[ans_pos[0]].squeeze(1)
                 
                 # 处理label_id
-                label_id = line_label.strip()  # 去除换行符并转换为整数
+                label_id = int(line_label.strip())  # 去除换行符并转换为整数
                 # TODO 把label_id转为A B C
                 label_id = chr(ord('A')+int(label_id-1))
                 print(f"Answer is: {answer_id}, with right ans is {label_id}")
@@ -209,23 +137,7 @@ if __name__ == "__main__":
 
                 loss = F.cross_entropy(gen_logits, target_token_id)
                 # 打印损失值
-                print("Cross Entropy Loss:", loss.item())
-            # answer_id = None
-            # gen_logits = None
-
-            # if "Answer:A" in response or "Answer:B" in response or "Answer:C" in response:
-            #     print("------enter processing------------")
-            #     response = response.split()
-            #     for i in range(len(response)):
-            #         if response[i] == '0' or response[i] == '1' or response[i] == '2':
-            #             answer_id = response[i]
-            #             gen_logits = model.saved_logits[i]
-            #             break
-
-            
-            
-            # print(f"Total generated steps: {len(model.saved_logits)}")
-            # print(f"logits shape = {model.saved_logits[-1].shape}")    
+                print("Cross Entropy Loss:", loss.item())  
             model.saved_logits = []
             
             print('-' * 60)

@@ -778,7 +778,6 @@ class MoEForCausalLM(MoEPreTrainedModel):
             return_dict=return_dict,
             dynamic_k=dynamic_k,
         )
-        # print(dynamic_k)
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         # print(logits.shape)
@@ -841,6 +840,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
+                "dynamic_k": kwargs.get("dynamic_k"),  # ✅ 添加这一行
             }
         )
         return model_inputs

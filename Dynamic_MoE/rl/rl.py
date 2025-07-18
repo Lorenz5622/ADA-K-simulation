@@ -152,6 +152,7 @@ if __name__ == "__main__":
     pop = ga.pop
     for _ in range(N_GENERATIONS):  # 迭代N代
         expert_list = ga.translateDNA()
+        print(f"new pop is:\n {expert_list}")
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
-        fitness = ga.get_fitness(torch.randint(low=1, high=11, size=(ga.POP_size,)))
+        fitness = ga.get_fitness(np.random.randint(low=1, high=11, size=ga.POP_size))
         pop = ga.select()  # 选择生成新的种群
