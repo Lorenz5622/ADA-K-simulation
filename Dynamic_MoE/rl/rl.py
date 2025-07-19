@@ -37,14 +37,15 @@ class GeneticAlgorithm:
 
     def crossover_and_mutation(self, CROSSOVER_RATE=0.8):
         new_pop = []
-        for father in pop:  # 遍历种群中的每一个个体，将该个体作为父亲
+        for father in self.pop:  # 遍历种群中的每一个个体，将该个体作为父亲
             child = father  # 孩子先得到父亲的全部基因（这里我把一串二进制串的那些0，1称为基因）
             if np.random.rand() < CROSSOVER_RATE:  # 产生子代时不是必然发生交叉，而是以一定的概率发生交叉
-                mother = pop[np.random.randint(self.POP_size)]  # 再种群中选择另一个个体，并将该个体作为母亲
+                mother = self.pop[np.random.randint(self.POP_size)]  # 再种群中选择另一个个体，并将该个体作为母亲
                 cross_points = np.random.randint(low=0, high=self.DNA_size)  # 随机产生交叉的点
                 child[cross_points:] = mother[cross_points:]  # 孩子得到位于交叉点后的母亲的基因
             self.mutation(child)  # 每个后代有一定的机率发生变异
             new_pop.append(child)
+        self.pop = np.array(new_pop)
 
         return new_pop
     
@@ -54,9 +55,11 @@ class GeneticAlgorithm:
             child[mutate_point] = child[mutate_point] ^ 1  # 将变异点的二进制为反转
     
     def select(self):  # nature selection wrt pop's fitness
+        probs = self.fitness / self.fitness.sum()
         idx = np.random.choice(np.arange(self.POP_size), size=self.POP_size, replace=True,
                             p=(self.fitness) / (self.fitness.sum()))
-        return pop[idx]
+        self.pop = np.array([self.pop[i] for i in idx])
+        return self.pop
     
     def print_info(self):
         fitness = self.fitness
@@ -148,11 +151,11 @@ if __name__ == "__main__":
 
     # print_info(pop)
     # plt.ioff()
-    ga = GeneticAlgorithm(20, 16*3) # 16代表有16层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
+    ga = GeneticAlgorithm(10, 24*3) # 16代表有16层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
     pop = ga.pop
     for _ in range(N_GENERATIONS):  # 迭代N代
         expert_list = ga.translateDNA()
         print(f"new pop is:\n {expert_list}")
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
-        fitness = ga.get_fitness(np.random.randint(low=1, high=11, size=ga.POP_size))
+        fitness = ga.get_fitness(np.random.uniform(low=1.0, high=5.0, size=ga.POP_size))
         pop = ga.select()  # 选择生成新的种群

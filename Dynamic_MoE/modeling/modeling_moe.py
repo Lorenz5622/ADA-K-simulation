@@ -218,7 +218,10 @@ class SwitchMLP(nn.Module):
         s = hidden_states.size(0)
         b = hidden_states.size(1)
         h = hidden_states.size(2)
-
+        # print(f"chosen k: {chosen_k}")
+        if chosen_k == 0:
+            return hidden_states
+        
         route = self.router(hidden_states)
         route = torch.nn.functional.softmax(route, dim=2)
         
