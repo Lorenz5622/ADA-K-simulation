@@ -55,9 +55,15 @@ class GeneticAlgorithm:
             child[mutate_point] = child[mutate_point] ^ 1  # 将变异点的二进制为反转
     
     def select(self):  # nature selection wrt pop's fitness
-        probs = self.fitness / self.fitness.sum()
-        idx = np.random.choice(np.arange(self.POP_size), size=self.POP_size, replace=True,
-                            p=(self.fitness) / (self.fitness.sum()))
+        # probs = self.fitness / self.fitness.sum()
+        # idx = np.random.choice(np.arange(self.POP_size), size=self.POP_size, replace=True,
+        #                     p=(self.fitness) / (self.fitness.sum()))
+        # self.pop = np.array([self.pop[i] for i in idx])
+        # return self.pop
+        logits = -self.fitness  # 取负号，使小值变大
+        probs = np.exp(logits) / np.exp(logits).sum()
+        print(f"size a:{np.arange(self.POP_size).shape} size p:{probs.shape}")
+        idx = np.random.choice(np.arange(self.POP_size), size=self.POP_size, replace=True, p=probs)
         self.pop = np.array([self.pop[i] for i in idx])
         return self.pop
     

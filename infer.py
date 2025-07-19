@@ -22,6 +22,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
                 pad_token_id=tokenizer.pad_token_id,
                 dynamic_k=dynamic_k,
                 max_new_tokens=32,top_p=0.9, temperature=1.0, do_sample=True)
+                # max_new_tokens=32, do_sample=False)
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
     response_ids = generate_ids[:, input_ids.shape[1]:]
@@ -49,7 +50,7 @@ def find_pattern(output_ids):
     return found_positions
 
 if __name__ == "__main__":
-    model_path = '/root/models/Dynamic_MoE'
+    model_path = '/home/cyx/models/Dynamic_MoE'
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -63,10 +64,10 @@ if __name__ == "__main__":
     ).cuda()
     model.eval()
 
-    file_json = '/root/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
-    file_label = '/root/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
+    file_json = '/home/cyx/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
+    file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
 
-    ga = GeneticAlgorithm(10, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
+    ga = GeneticAlgorithm(5, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
     pop = ga.pop
     for _ in range(N_GENERATIONS):  # 迭代N代
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
@@ -84,7 +85,7 @@ if __name__ == "__main__":
 
                 for line_json, line_label in data_pairs:
                     # 解析 JSON 行
-                    if count >= 10:
+                    if count >= 5:
                         break
                     data = json.loads(line_json.strip())
                     correct_index = int(line_label.strip())
@@ -110,10 +111,10 @@ if __name__ == "__main__":
                         <HUMAN>: Context: {data['context']}
                         Question: {data['question']}
                         Options:
-                        - A: {data['answerA']}
-                        - B: {data['answerB']}
-                        - C: {data['answerC']}
-                        <BOT>: """
+                        A: {data['answerA']}
+                        B: {data['answerB']}
+                        C: {data['answerC']}
+                        <BOT>: Answer:"""
                     # 打印或处理这些数据（例如构建模型输入）
                     # print(prompt)
                     # dynamic_k = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
@@ -122,29 +123,38 @@ if __name__ == "__main__":
                     # 强行匹配，如果有answer:A B C 才进入后续处理，否则跳过。使用对应的id进行匹配
                     # print("Generated Response:", response)
                     ans_pos = find_pattern(output_ids)
-                    torch.save(model.saved_logits, "/root/files/saved_logits.pt")
+                    torch.save(model.saved_logits, "/home/cyx/files/saved_logits.pt")
                     # print("Logits saved to 'saved_logits.pt'")
                     
+                    gen_logits = model.saved_logits[0].squeeze(1)
+                    label_id = int(line_label.strip())  # 去除换行符并转换为整数
+                    label_id = chr(ord('A')+int(label_id-1))
+                    token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
+                    target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
+                    loss = F.cross_entropy(gen_logits, target_token_id)
+                    loss_list.append(loss.item()+sum(experts)/len(experts))
+                    print(f"第 {i} 个expert的第 {count} 个用例")
+                    count += 1
                     # 判断是否正确输出并处理answer_id
-                    if len(ans_pos) == 1:
-                        count += 1
-                        print(f"第 {i} 个expert的第 {count} 个成功")
-                        answer_id = output_ids[0, ans_pos[0]]
-                        gen_logits = model.saved_logits[ans_pos[0]].squeeze(1)
+                    # if len(ans_pos) == 1:
+                    #     count += 1
+                    #     print(f"第 {i} 个expert的第 {count} 个成功")
+                    #     answer_id = output_ids[0, ans_pos[0]]
+                    #     gen_logits = model.saved_logits[ans_pos[0]].squeeze(1)
                         
-                        # 处理label_id
-                        label_id = int(line_label.strip())  # 去除换行符并转换为整数
-                        # TODO 把label_id转为A B C
-                        label_id = chr(ord('A')+int(label_id-1))
-                        print(f"Answer is: {answer_id}, with right ans is {label_id}")
-                        label_token = tokenizer.encode(label_id, return_tensors="pt")
-                        token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
-                        target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
+                    #     # 处理label_id
+                    #     label_id = int(line_label.strip())  # 去除换行符并转换为整数
+                    #     # TODO 把label_id转为A B C
+                    #     label_id = chr(ord('A')+int(label_id-1))
+                    #     print(f"Answer is: {answer_id}, with right ans is {label_id}")
+                    #     label_token = tokenizer.encode(label_id, return_tensors="pt")
+                    #     token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
+                    #     target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
 
-                        loss = F.cross_entropy(gen_logits, target_token_id)
-                        # 打印损失值
-                        print("Cross Entropy Loss:", loss.item())
-                        loss_list.append(loss.item()+sum(experts)/15.0)
+                    #     loss = F.cross_entropy(gen_logits, target_token_id)
+                    #     # 打印损失值
+                    #     print("Cross Entropy Loss:", loss.item())
+                    #     loss_list.append(loss.item()+sum(experts)/15.0)
                     model.saved_logits = []
                     
                     print('-' * 60)
