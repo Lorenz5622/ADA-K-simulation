@@ -762,6 +762,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
         ```"""
         # print("------------"+dynamic_k+"----------------")
+        # print(f"dynamic_k: {dynamic_k}")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -843,7 +844,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "dynamic_k": kwargs.get("dynamic_k"),  # ✅ 添加这一行
+                "dynamic_k": kwargs.get("dynamic_k"),
             }
         )
         return model_inputs
