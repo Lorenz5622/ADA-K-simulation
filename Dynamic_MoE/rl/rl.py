@@ -6,7 +6,7 @@ import torch.nn.functional
 DNA_SIZE = 24
 POP_SIZE = 80
 CROSSOVER_RATE = 0.6
-MUTATION_RATE = 0.01
+MUTATION_RATE = 0.005
 N_GENERATIONS = 100
 X_BOUND = [-2.048, 2.048]
 Y_BOUND = [-2.048, 2.048]
@@ -16,7 +16,7 @@ class GeneticAlgorithm:
         self.DNA_size = length
         self.POP_size = pop_size
         self.fitness = None
-        self.pop = np.random.randint(9, size=(self.POP_size, self.DNA_size))
+        self.pop = np.random.randint(5, size=(self.POP_size, self.DNA_size))
     
     def F(self, x, label):
         return torch.nn.functional.cross_entropy(x, label)
@@ -49,9 +49,15 @@ class GeneticAlgorithm:
         if np.random.rand() < MUTATION_RATE:  # 以MUTATION_RATE的概率进行变异
             mutate_point = np.random.randint(0, self.DNA_size)  # 随机产生一个实数，代表要变异基因的位置
             if np.random.rand() < 0.5:
-                child[mutate_point] = child[mutate_point] + 1
+                if child[mutate_point] < 6:
+                    child[mutate_point] = child[mutate_point] + 1
+                else:
+                    child[mutate_point] = child[mutate_point] - 1
             else:
-                child[mutate_point] = child[mutate_point] - 1
+                if child[mutate_point] > 0:
+                    child[mutate_point] = child[mutate_point] - 1
+                else:
+                    child[mutate_point] = child[mutate_point] + 1
     
     def select(self):  # nature selection wrt pop's fitness
         # probs = self.fitness / self.fitness.sum()
@@ -59,9 +65,11 @@ class GeneticAlgorithm:
         #                     p=(self.fitness) / (self.fitness.sum()))
         # self.pop = np.array([self.pop[i] for i in idx])
         # return self.pop
-        logits = 1/self.fitness  # 取负号，使小值变大
+        logits = 1/self.fitness
         probs = np.exp(logits) / np.exp(logits).sum()
         print(f"size a:{np.arange(self.POP_size).shape} size p:{probs.shape}")
+        print(f"logits:, {logits}")
+        print(f"probs:{probs}")
         idx = np.random.choice(np.arange(self.POP_size), size=self.POP_size, replace=True, p=probs)
         self.pop = np.array([self.pop[i] for i in idx])
         return self.pop

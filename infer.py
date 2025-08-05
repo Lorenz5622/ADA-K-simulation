@@ -5,12 +5,12 @@ from Dynamic_MoE.modeling.configuration_moe import MoEConfig
 import json
 import torch.nn.functional as F
 import random
-from Dynamic_MoE.Dynamic_MoE.rl.rl import GeneticAlgorithm
+from Dynamic_MoE.rl.rl import GeneticAlgorithm
 import numpy as np
 
-N_GENERATIONS = 50
+N_GENERATIONS = 100
 CROSSOVER_RATE = 0.6
-MUTATION_RATE = 0.02
+MUTATION_RATE = 0.012
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -68,9 +68,9 @@ if __name__ == "__main__":
     file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(60, 32) # 24代表有24层
+    ga = GeneticAlgorithm(10, 32) # 24代表有24层
     pop = ga.pop
-    for _ in range(N_GENERATIONS):  # 迭代N代
+    for gen_count in range(N_GENERATIONS):  # 迭代N代
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
         expert_list = ga.translateDNA()
         # print(f"new pop is:\n {expert_list}")
@@ -134,7 +134,7 @@ if __name__ == "__main__":
                     token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
                     target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
                     loss = F.cross_entropy(gen_logits, target_token_id)
-                    loss_sum += loss.item()+sum(experts)/len(experts)
+                    loss_sum += loss.item()*10+sum(experts)/len(experts)
                     print(f"第 {i} 个expert的第 {count} 个用例")
                     count += 1
                     # 判断是否正确输出并处理answer_id
@@ -160,7 +160,9 @@ if __name__ == "__main__":
                     model.saved_logits = []
                     print('-' * 60)
             loss_list.append(loss_sum/5)
+            # print(f"loss_sum: {loss_sum}")
 
+        print(f"generation No. {gen_count}: ")
         fitness = ga.get_fitness(np.array(loss_list))
         ga.print_info()
         pop = ga.select()  # 选择生成新的种群
