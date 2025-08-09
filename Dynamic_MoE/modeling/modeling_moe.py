@@ -397,7 +397,6 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
-
         if output_attentions:
             outputs += (self_attn_weights,)
 
@@ -636,6 +635,8 @@ class MoEModel(MoEPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
+        collected_hidden_states = []
+
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -670,6 +671,9 @@ class MoEModel(MoEPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
+            print(f"hidden_states{idx}.shape:{hidden_states.shape}")
+
+            collected_hidden_states.append(hidden_states)
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -677,12 +681,13 @@ class MoEModel(MoEPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
+
         hidden_states = self.norm(hidden_states)
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
+        print(f"return dict: {return_dict}")
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
@@ -691,6 +696,7 @@ class MoEModel(MoEPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
+            hidden_states_all=collected_hidden_states,
         )
 
 class MoEForCausalLM(MoEPreTrainedModel):
@@ -699,6 +705,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         self.model = MoEModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.saved_logits = []
+        self.collected_hidden_states = []
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -783,9 +790,18 @@ class MoEForCausalLM(MoEPreTrainedModel):
             dynamic_k=dynamic_k,
         )
         hidden_states = outputs[0]
+        collected_hidden_states = outputs.hidden_states_all
+        print(f"hidden_states.shape:{hidden_states.shape}")
         logits = self.lm_head(hidden_states)
-        # print(logits.shape)
-
+        for idx in range(len(collected_hidden_states)):
+            if logits.dim() == 3:
+                if logits.size(1) > 1:  # 第一次生成
+                    self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
+                else:
+                    self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
+            
+            print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
+        print(f"logits.shape: {logits.shape}")
         if logits.dim() == 3:
             if logits.size(1) > 1:  # 第一次生成
                 self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token

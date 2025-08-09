@@ -9,7 +9,7 @@ from Dynamic_MoE.rl.rl import GeneticAlgorithm
 import numpy as np
 
 N_GENERATIONS = 100
-CROSSOVER_RATE = 0.6
+CROSSOVER_RATE = 0.5
 MUTATION_RATE = 0.012
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
@@ -68,7 +68,7 @@ if __name__ == "__main__":
     file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(10, 32) # 24代表有24层
+    ga = GeneticAlgorithm(40, 32) # 24代表有24层
     pop = ga.pop
     for gen_count in range(N_GENERATIONS):  # 迭代N代
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
@@ -122,7 +122,6 @@ if __name__ == "__main__":
                     # dynamic_k = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
                     dynamic_k = experts
                     response, output_ids = generate(tokenizer, model, prompt, dynamic_k.tolist()) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
-                    # 强行匹配，如果有answer:A B C 才进入后续处理，否则跳过。使用对应的id进行匹配
                     # print("Generated Response:", response)
                     ans_pos = find_pattern(output_ids)
                     torch.save(model.saved_logits, "/home/cyx/files/saved_logits.pt")
