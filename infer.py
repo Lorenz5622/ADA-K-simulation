@@ -21,7 +21,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 dynamic_k=dynamic_k,
-                max_new_tokens=32,top_p=0.9, temperature=1.0, do_sample=True)
+                max_new_tokens=8,top_p=0.9, temperature=1.0, do_sample=True)
                 # max_new_tokens=32, do_sample=False)
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
@@ -63,6 +63,11 @@ if __name__ == "__main__":
         low_cpu_mem_usage=True
     ).cuda()
     model.eval()
+
+    hidden_layers = 0
+    with open('/home/cyx/models/Dynamic_MoE/config.json', 'r', encoding='utf-8') as file:
+        data = json.load(file)
+        hidden_layers = data['num_hidden_layers']
 
     file_json = '/home/cyx/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
     file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
@@ -117,7 +122,7 @@ if __name__ == "__main__":
                         B: {data['answerB']}
                         C: {data['answerC']}
                         <BOT>: Answer:"""
-                    # 打印或处理这些数据（例如构建模型输入）
+                    # 打印或处理这些数据（例如构建模型输入）s
                     # print(prompt)
                     # dynamic_k = [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2]
                     dynamic_k = experts
@@ -132,8 +137,11 @@ if __name__ == "__main__":
                     label_id = chr(ord('A')+int(label_id-1))
                     token_id = tokenizer.convert_tokens_to_ids(label_id)  # 如 29889
                     target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
-                    loss = F.cross_entropy(gen_logits, target_token_id)
-                    loss_sum += loss.item()*10+sum(experts)/len(experts)
+                    loss = F.cross_entropy(gen_logits.squeeze(1), target_token_id)
+                    loss = 0
+                    for layer_logits in model.collected_hidden_states[:hidden_layers]:
+                        loss += F.cross_entropy(layer_logits.squeeze(1), target_token_id)
+                    loss_sum += loss.item()+sum(experts)/len(experts)
                     print(f"第 {i} 个expert的第 {count} 个用例")
                     count += 1
                     # 判断是否正确输出并处理answer_id
@@ -157,6 +165,7 @@ if __name__ == "__main__":
                     #     print("Cross Entropy Loss:", loss.item())
                     #     loss_list.append(loss.item()+sum(experts)/15.0)
                     model.saved_logits = []
+                    model.collected_hidden_states = []
                     print('-' * 60)
             loss_list.append(loss_sum/5)
             # print(f"loss_sum: {loss_sum}")

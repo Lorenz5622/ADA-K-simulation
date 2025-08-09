@@ -791,7 +791,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         )
         hidden_states = outputs[0]
         collected_hidden_states = outputs.hidden_states_all
-        print(f"hidden_states.shape:{hidden_states.shape}")
+        # print(f"hidden_states.shape:{hidden_states.shape}")
         logits = self.lm_head(hidden_states)
         for idx in range(len(collected_hidden_states)):
             if logits.dim() == 3:
@@ -800,8 +800,8 @@ class MoEForCausalLM(MoEPreTrainedModel):
                 else:
                     self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
             
-            print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
-        print(f"logits.shape: {logits.shape}")
+        #     print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
+        # print(f"logits.shape: {logits.shape}")
         if logits.dim() == 3:
             if logits.size(1) > 1:  # 第一次生成
                 self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token
