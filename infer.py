@@ -7,10 +7,11 @@ import torch.nn.functional as F
 import random
 from Dynamic_MoE.rl.rl import GeneticAlgorithm
 import numpy as np
-
-N_GENERATIONS = 100
+import os
+N_GENERATIONS = 800
 CROSSOVER_RATE = 0.5
-MUTATION_RATE = 0.012
+MUTATION_RATE = 0.0015
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -21,7 +22,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
                 dynamic_k=dynamic_k,
-                max_new_tokens=8,top_p=0.9, temperature=1.0, do_sample=True)
+                max_new_tokens=4,top_p=0.9, temperature=1.0, do_sample=True)
                 # max_new_tokens=32, do_sample=False)
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
@@ -73,7 +74,7 @@ if __name__ == "__main__":
     file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(40, 32) # 24代表有24层
+    ga = GeneticAlgorithm(150, 32) # 24代表有24层
     pop = ga.pop
     for gen_count in range(N_GENERATIONS):  # 迭代N代
         pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE))
@@ -139,10 +140,13 @@ if __name__ == "__main__":
                     target_token_id = torch.tensor([token_id]).cuda()  # tensor([29889], device='cuda:0')
                     loss = F.cross_entropy(gen_logits.squeeze(1), target_token_id)
                     loss = 0
-                    for layer_logits in model.collected_hidden_states[:hidden_layers]:
-                        loss += F.cross_entropy(layer_logits.squeeze(1), target_token_id)
-                    loss_sum += loss.item()+sum(experts)/len(experts)
-                    print(f"第 {i} 个expert的第 {count} 个用例")
+                    for idx, layer_logits in enumerate(model.collected_hidden_states[:hidden_layers]):
+                        if idx < 23:
+                            loss += F.cross_entropy(layer_logits.squeeze(1), target_token_id)*0 
+                        else:
+                            loss += F.cross_entropy(layer_logits.squeeze(1), target_token_id)*1.0
+                    loss_sum += loss.item()+(sum(experts)/len(experts))*0.05
+                    # print(f"第 {i} 个expert的第 {count} 个用例")
                     count += 1
                     # 判断是否正确输出并处理answer_id
                     # if len(ans_pos) == 1:
@@ -167,7 +171,7 @@ if __name__ == "__main__":
                     model.saved_logits = []
                     model.collected_hidden_states = []
                     print('-' * 60)
-            loss_list.append(loss_sum/5)
+            loss_list.append(loss_sum)
             # print(f"loss_sum: {loss_sum}")
 
         print(f"generation No. {gen_count}: ")

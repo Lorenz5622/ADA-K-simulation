@@ -76,9 +76,12 @@ class GeneticAlgorithm:
     
     def print_info(self):
         max_fitness_index = np.argmax(self.fitness)
+        min_fitness_index = np.argmin(self.fitness)
         print("max_fitness:", self.fitness[max_fitness_index])
+        print("min_fitness:", self.fitness[min_fitness_index])
         expert_list = self.translateDNA()
-        print("最优的基因型：", expert_list[max_fitness_index])
+        print("最优的基因型(max): ", expert_list[max_fitness_index])
+        print("最优的基因型(min): ", expert_list[min_fitness_index])
         # print("expert_list:", expert_list[max_fitness_index])
 
 # def init_pop(expert_size, expert_len):

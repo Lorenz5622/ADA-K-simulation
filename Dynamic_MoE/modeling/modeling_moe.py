@@ -37,7 +37,7 @@ from .configuration_moe import MoEConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
-
+test_flag = False # 为true给训练使用
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -671,7 +671,7 @@ class MoEModel(MoEPreTrainedModel):
                 )
 
             hidden_states = layer_outputs[0]
-            print(f"hidden_states{idx}.shape:{hidden_states.shape}")
+            # print(f"hidden_states{idx}.shape:{hidden_states.shape}")
 
             collected_hidden_states.append(hidden_states)
 
@@ -687,17 +687,26 @@ class MoEModel(MoEPreTrainedModel):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-        print(f"return dict: {return_dict}")
+        # print(f"return dict: {return_dict}")
         next_cache = next_decoder_cache if use_cache else None
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
-            hidden_states_all=collected_hidden_states,
-        )
+        if test_flag:
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                hidden_states_all=collected_hidden_states,
+                )
+        else: 
+            return BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,
+                # hidden_states_all=collected_hidden_states,
+            )
 
 class MoEForCausalLM(MoEPreTrainedModel):
     def __init__(self, config):
@@ -790,17 +799,17 @@ class MoEForCausalLM(MoEPreTrainedModel):
             dynamic_k=dynamic_k,
         )
         hidden_states = outputs[0]
-        collected_hidden_states = outputs.hidden_states_all
-        # print(f"hidden_states.shape:{hidden_states.shape}")
         logits = self.lm_head(hidden_states)
-        for idx in range(len(collected_hidden_states)):
-            if logits.dim() == 3:
-                if logits.size(1) > 1:  # 第一次生成
-                    self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
-                else:
-                    self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
-            
-        #     print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
+        if(test_flag):
+            collected_hidden_states = outputs.hidden_states_all
+            for idx in range(len(collected_hidden_states)):
+                if logits.dim() == 3:
+                    if logits.size(1) > 1:  # 第一次生成
+                        self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
+                    else:
+                        self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
+                
+                # print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
         # print(f"logits.shape: {logits.shape}")
         if logits.dim() == 3:
             if logits.size(1) > 1:  # 第一次生成
