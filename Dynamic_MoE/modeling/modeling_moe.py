@@ -37,7 +37,7 @@ from .configuration_moe import MoEConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
-test_flag = False # 为true给训练使用
+test_flag = True # 为true给训练使用
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
 def _make_causal_mask(
@@ -638,6 +638,7 @@ class MoEModel(MoEPreTrainedModel):
         collected_hidden_states = []
 
         for idx, decoder_layer in enumerate(self.layers):
+            # print(idx)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -817,7 +818,8 @@ class MoEForCausalLM(MoEPreTrainedModel):
         #     else:
         #         self.saved_logits.append(logits)  # 后续每个都直接保存
         self.saved_logits.append(logits)  # 后续每个都直接保存
-        # print(len(self.saved_logits))
+        # print(f"new logits: {logits.shape}")
+        # print(f"self.saved_logits: {len(self.saved_logits)}")
 
         loss = None
         if labels is not None:

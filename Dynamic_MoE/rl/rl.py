@@ -34,13 +34,13 @@ class GeneticAlgorithm:
     def crossover_and_mutation(self, pops, CROSSOVER_RATE=0.8, MUTATION_RATE=0.01):
         new_pop = []
         pop_size = len(pops)
-        for father in pops:  # 遍历种群中的每一个个体，将该个体作为父亲
-            child = father.copy()  # 孩子先得到父亲的全部基因（这里我把一串二进制串的那些0，1称为基因）
-            if np.random.rand() < CROSSOVER_RATE:  # 产生子代时不是必然发生交叉，而是以一定的概率发生交叉
-                mother = pops[np.random.randint(pop_size)].copy()  # 再种群中选择另一个个体，并将该个体作为母亲
-                cross_points = np.random.randint(low=0, high=self.DNA_size)  # 随机产生交叉的点
-                child[cross_points:] = mother[cross_points:]  # 孩子得到位于交叉点后的母亲的基因
-            child = self.mutation(child, MUTATION_RATE=MUTATION_RATE)  # 每个后代有一定的机率发生变异
+        for father in pops:
+            child = father.copy()
+            if np.random.rand() < CROSSOVER_RATE:
+                mother = pops[np.random.randint(pop_size)].copy()
+                cross_points = np.random.randint(low=0, high=self.DNA_size)
+                child[cross_points:] = mother[cross_points:]
+            child = self.mutation(child, MUTATION_RATE=MUTATION_RATE)
             new_pop.append(child)
 
         return new_pop
@@ -52,14 +52,12 @@ class GeneticAlgorithm:
                     if child[mutate_point] < MAX_EXPERT:
                         child[mutate_point] = child[mutate_point] + 1
                     else:
-                    # 如果已达到最大值，则尝试减小
                         if child[mutate_point] > 0:
                             child[mutate_point] = child[mutate_point] - 1
                 else:
                     if child[mutate_point] > 0:
                         child[mutate_point] = child[mutate_point] - 1
                     else:
-                    # 如果已达到最小值，则尝试增大
                         if child[mutate_point] < MAX_EXPERT:
                             child[mutate_point] = child[mutate_point] + 1
         return child
@@ -142,6 +140,24 @@ class GeneticAlgorithm:
         expert_list = self.translateDNA()
         print("最优的基因型(max): ", expert_list[max_fitness_index])
         print("最优的基因型(min): ", expert_list[min_fitness_index])
+    
+    def write_to_record(self, file, gen):
+        inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
+        to_write = f"--------No. {gen}----------\n"
+        to_write += (f"best_fitness_original: {min(self.fitness)} \n")
+        # 归一化为概率
+        fitness_norm = inv_fitness / inv_fitness.sum()
+        max_fitness_index = np.argmax(fitness_norm)
+        min_fitness_index = np.argmin(fitness_norm)
+        to_write += (f"max_fitness: {fitness_norm[max_fitness_index]}\n")
+        to_write += (f"min_fitness: {fitness_norm[min_fitness_index]}\n")
+        expert_list = self.translateDNA()
+        to_write += (f"最优的基因型(max):{expert_list[max_fitness_index]} \n")
+        to_write += (f"最优的基因型(min): {expert_list[min_fitness_index]} \n")
+        with open(file, 'a'):
+            file.write(to_write)
+        return
+
     
 
 

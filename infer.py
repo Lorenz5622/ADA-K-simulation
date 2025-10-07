@@ -8,9 +8,11 @@ import random
 from Dynamic_MoE.rl.rl import GeneticAlgorithm
 import numpy as np
 import os
-N_GENERATIONS = 400
+from datetime import datetime
+N_GENERATIONS = 500
 CROSSOVER_RATE = 0.5
 MUTATION_RATE = 0.03
+MAX_DATASET_COUNT = 30
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
@@ -49,8 +51,61 @@ def find_pattern(output_ids):
                 break
 
     return found_positions
+
+def analysis_siqa(line_json, line_label):
+    data = json.loads(line_json.strip())
+    prompt = f"""
+        Context: {data['context']}
+        Question: {data['question']}
+        Options:
+        A: {data['answerA']}
+        B: {data['answerB']}
+        C: {data['answerC']}
+        Answer:"""
+    return prompt
+
+def analysis_piqa(line_json, line_label):
+    data = json.loads(line_json.strip())
+    prompt = f"""
+        Question: {data['goal']}
+        Options:
+        A: {data['sol1']}
+        B: {data['sol2']}
+        Answer:"""
+    return prompt
+
+def random_n_dataset(file_json, file_label):
+    output_data = '/home/cyx/datasets/piqa/sampled_30_data.jsonl'
+    output_label = '/home/cyx/datasets/piqa/sampled_30_labels.lst'
+
+    # 读取数据和标签，并构建成 pairs
+    with open(file_json, 'r', encoding='utf-8') as f_json, \
+        open(file_label, 'r', encoding='utf-8') as f_label:
+
+        pairs = [
+            (json.loads(data_line.strip()), label_line.strip())
+            for data_line, label_line in zip(f_json, f_label)
+            if data_line.strip() and label_line.strip()
+        ]
+    sampled_pairs = random.sample(pairs, MAX_DATASET_COUNT)
+
+    with open(output_data, 'w', encoding='utf-8') as f_data, \
+        open(output_label, 'w', encoding='utf-8') as f_label:
+
+        for data, label in sampled_pairs:
+            # 保存原始数据（不加 label 字段）
+            f_data.write(json.dumps(data, ensure_ascii=False) + '\n')
+            # 保存标签（每行一个）
+            f_label.write(label + '\n')
+    
+    return output_data, output_label
+
 if __name__ == "__main__":
     model_path = '/home/cyx/models/Dynamic_MoE'
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")  # 例如：20251007_213015
+
+    # 构造文件名
+    record_file = f"output_{now}.txt"
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -69,11 +124,15 @@ if __name__ == "__main__":
         data = json.load(file)
         hidden_layers = data['num_hidden_layers']
 
-    file_json = '/home/cyx/datasets/siqa/socialiqa-train-dev/train.jsonl'   # 第一个文件路径
-    file_label = '/home/cyx/datasets/siqa/socialiqa-train-dev/train-labels.lst'  # 第二个文件路径
+    file_json = '/home/cyx/datasets/piqa/train.jsonl'   # 第一个文件路径
+    file_label = '/home/cyx/datasets/piqa/train-labels.lst'  # 第二个文件路径
+    file_json, file_label = random_n_dataset(file_json, file_label)
+
+    print(file_json, file_label,)
+    # 抽取N条保存为另一个文件中
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(100, 32) # 24代表有24层
+    ga = GeneticAlgorithm(100, 24) # 24代表有24层
     pop = ga.pop
     for gen_count in range(N_GENERATIONS):  # 迭代N代
         # pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE, MUTATION_RATE))
@@ -91,18 +150,19 @@ if __name__ == "__main__":
                 loss_sum = 0
                 for line_json, line_label in data_pairs:
                     # 解析 JSON 行
-                    if count >= 50:
+                    if count >= MAX_DATASET_COUNT:
                         break
-                    data = json.loads(line_json.strip())
-                    correct_index = int(line_label.strip())
-                    prompt = f"""
-                        Context: {data['context']}
-                        Question: {data['question']}
-                        Options:
-                        A: {data['answerA']}
-                        B: {data['answerB']}
-                        C: {data['answerC']}
-                        Answer:"""
+                    # data = json.loads(line_json.strip())
+                    # correct_index = int(line_label.strip())
+                    # prompt = f"""
+                    #     Context: {data['context']}
+                    #     Question: {data['question']}
+                    #     Options:
+                    #     A: {data['answerA']}
+                    #     B: {data['answerB']}
+                    #     C: {data['answerC']}
+                    #     Answer:"""
+                    prompt = analysis_piqa(line_json, line_label)
                     dynamic_k = experts
                     response, output_ids = generate(tokenizer, model, prompt, dynamic_k.tolist()) # 673 answer, 29901 ':', 29909 A, 29933 B, 29907 C, 0 空格
                     
@@ -121,10 +181,12 @@ if __name__ == "__main__":
                     with torch.no_grad():
                         # 获取模型输出
                         outputs = model.saved_logits[0]  # [batch_size, seq_len, vocab_size]
+                        # print(f"outputs.shape: {outputs.shape}")
                         inputs = tokenizer(prompt,return_tensors="pt")
                         
                         # 构造 shift_logits 和 shift_labels
                         shift_logits = outputs[..., :-1, :].contiguous().float()
+                        # print(f"shift_logits.shape: {shift_logits.shape}")
                         shift_labels = inputs.input_ids[..., 1:].contiguous().cuda()
                         # 计算 loss
                         loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=tokenizer.pad_token_id)
@@ -154,7 +216,11 @@ if __name__ == "__main__":
         print(f"generation No. {gen_count}: ")
         fitness = ga.get_fitness(np.array(loss_list))
         ga.print_info()
+        if gen_count % 20 == 0:
+            ga.write_to_record(record_file, gen_count)
         pop = ga.select()  # 选择生成新的种群
+
+
         
             
 
