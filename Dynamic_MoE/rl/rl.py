@@ -154,8 +154,8 @@ class GeneticAlgorithm:
         expert_list = self.translateDNA()
         to_write += (f"最优的基因型(max):{expert_list[max_fitness_index]} \n")
         to_write += (f"最优的基因型(min): {expert_list[min_fitness_index]} \n")
-        with open(file, 'a'):
-            file.write(to_write)
+        with open(file, 'a') as f:
+            f.write(to_write)
         return
 
     

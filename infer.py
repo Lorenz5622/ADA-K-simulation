@@ -12,7 +12,7 @@ from datetime import datetime
 N_GENERATIONS = 500
 CROSSOVER_RATE = 0.5
 MUTATION_RATE = 0.03
-MAX_DATASET_COUNT = 30
+MAX_DATASET_COUNT = 100
 os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
@@ -126,26 +126,27 @@ if __name__ == "__main__":
 
     file_json = '/home/cyx/datasets/piqa/train.jsonl'   # 第一个文件路径
     file_label = '/home/cyx/datasets/piqa/train-labels.lst'  # 第二个文件路径
-    file_json, file_label = random_n_dataset(file_json, file_label)
+    # file_json, file_label = random_n_dataset(file_json, file_label)
 
-    print(file_json, file_label,)
+    # print(file_json, file_label,)
     # 抽取N条保存为另一个文件中
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(100, 24) # 24代表有24层
+    ga = GeneticAlgorithm(30, 24) # 24代表有24层
     pop = ga.pop
     for gen_count in range(N_GENERATIONS):  # 迭代N代
         # pop = np.array(ga.crossover_and_mutation(CROSSOVER_RATE, MUTATION_RATE))
         expert_list = ga.translateDNA()
         # print(f"new pop is:\n {expert_list}")
         loss_list = []
-        for i, experts in enumerate(expert_list):
-            count = 0
-            with open(file_json, 'r', encoding='utf-8') as fj, \
-                open(file_label, 'r', encoding='utf-8') as fl:
-                data_pairs = list(zip(fj.readlines(), fl.readlines()))
-                # 打乱顺序
-                random.shuffle(data_pairs)
+        with open(file_json, 'r', encoding='utf-8') as fj, \
+            open(file_label, 'r', encoding='utf-8') as fl:
+            data_pairs = list(zip(fj.readlines(), fl.readlines()))
+            # 打乱顺序
+            random.shuffle(data_pairs)
+            for i, experts in enumerate(expert_list):
+                count = 0
+            
 
                 loss_sum = 0
                 for line_json, line_label in data_pairs:
@@ -210,7 +211,7 @@ if __name__ == "__main__":
                     model.collected_hidden_states = []
                     # print('-' * 60)
                 loss_sum = loss_sum / count
-            loss_list.append(loss_sum)
+                loss_list.append(loss_sum)
             # print(f"loss_sum: {loss_sum}")
 
         print(f"generation No. {gen_count}: ")
