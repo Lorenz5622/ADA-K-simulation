@@ -1,3 +1,4 @@
+from datetime import datetime
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib import cm
@@ -143,7 +144,8 @@ class GeneticAlgorithm:
     
     def write_to_record(self, file, gen):
         inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
-        to_write = f"--------No. {gen}----------\n"
+        time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        to_write = f"--------No. {gen}: {time}----------\n"
         to_write += (f"best_fitness_original: {min(self.fitness)} \n")
         # 归一化为概率
         fitness_norm = inv_fitness / inv_fitness.sum()

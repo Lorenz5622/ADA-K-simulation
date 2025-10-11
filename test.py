@@ -6,6 +6,7 @@ from transformers import AutoTokenizer
 from Dynamic_MoE.modeling.modeling_moe import MoEForCausalLM
 from Dynamic_MoE.modeling.configuration_moe import MoEConfig
 import numpy as np
+from datetime import datetime
 
 def setup_model_on_gpu(gpu_id, model_path):
     """
@@ -145,9 +146,10 @@ def simple_calculation_demo():
     print(f"聚合结果: {total_result}")
 
 if __name__ == "__main__":
-    print("=== 简单数值计算多GPU演示 ===")
-    simple_calculation_demo()
+    # print("=== 简单数值计算多GPU演示 ===")
+    # simple_calculation_demo()
     
-    print("\n=== 模型推理多GPU演示 ===")
-    # 注意：如果你要运行模型推理演示，需要确保模型路径正确
-    parallel_inference_demo()
+    # print("\n=== 模型推理多GPU演示 ===")
+    # # 注意：如果你要运行模型推理演示，需要确保模型路径正确
+    # parallel_inference_demo()
+    print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

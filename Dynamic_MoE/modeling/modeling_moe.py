@@ -698,7 +698,7 @@ class MoEModel(MoEPreTrainedModel):
                 past_key_values=next_cache,
                 hidden_states=all_hidden_states,
                 attentions=all_self_attns,
-                hidden_states_all=collected_hidden_states,
+                # hidden_states_all=collected_hidden_states,
                 )
         else: 
             return BaseModelOutputWithPast(
@@ -801,14 +801,14 @@ class MoEForCausalLM(MoEPreTrainedModel):
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        if(test_flag):
-            collected_hidden_states = outputs.hidden_states_all
-            for idx in range(len(collected_hidden_states)):
-                if logits.dim() == 3:
-                    if logits.size(1) > 1:  # 第一次生成
-                        self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
-                    else:
-                        self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
+        # if(test_flag):
+        #     collected_hidden_states = outputs.hidden_states_all
+        #     for idx in range(len(collected_hidden_states)):
+        #         if logits.dim() == 3:
+        #             if logits.size(1) > 1:  # 第一次生成
+        #                 self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
+        #             else:
+        #                 self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
                 
                 # print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
         # print(f"logits.shape: {logits.shape}")

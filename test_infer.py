@@ -5,20 +5,34 @@ from Dynamic_MoE.modeling.configuration_moe import MoEConfig
 
 
 
-def generate(tokenizer, model, text):
-    inputs = [text]
-    tokens = tokenizer(inputs,return_tensors="pt")
+def generate(tokenizer, model, texts):
+    tokens = tokenizer(texts, return_tensors="pt", padding=True)
     input_ids = tokens.input_ids.cuda()
-    generate_ids = model.generate(inputs=input_ids,
-                num_beams=1, 
-                bos_token_id=tokenizer.bos_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id,
-                dynamic_k=[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
-                max_new_tokens=32,top_p=0.9, temperature=1.0, do_sample=True)
+    
+    generate_ids = model.generate(
+        inputs=input_ids,
+        num_beams=1, 
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        dynamic_k=[2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2],
+        max_new_tokens=32,
+        top_p=0.9, 
+        temperature=1.0, 
+        do_sample=True
+    )
+    
+    # 批量解码
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
-    return response
+    
+    # 提取生成部分（去除输入部分）
+    responses = []
+    for i, output in enumerate(outputs):
+        input_length = len(texts[i])
+        response = output[len(texts[i]):]
+        responses.append(response)
+    
+    return responses
     
     
 
@@ -36,7 +50,13 @@ if __name__ == "__main__":
         low_cpu_mem_usage=True
     ).cuda()    
     model.eval()
-
-    response = generate(tokenizer, model, 'The highest mountain in the world is')
-    print(response)
-    
+    prompts = [
+        'The highest mountain in the world is',
+        'The capital of France is',
+        'The largest ocean on Earth is'
+    ]
+    responses = generate(tokenizer, model, prompts)
+    for i, (prompt, response) in enumerate(zip(prompts, responses)):
+        print(f"Prompt {i+1}: {prompt}")
+        print(f"Response {i+1}: {response}")
+        print("-" * 50)
