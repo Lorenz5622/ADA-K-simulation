@@ -10,10 +10,11 @@ import numpy as np
 import os
 from datetime import datetime
 N_GENERATIONS = 500
-CROSSOVER_RATE = 0.5
-MUTATION_RATE = 0.03
-MAX_DATASET_COUNT = 100
-MAX_DATASET_EPOCHS = 8
+CROSSOVER_RATE = 0.4
+MUTATION_RATE = 0.05
+MAX_DATASET_COUNT = 150
+MAX_DATASET_EPOCHS = 40
+INDIVIDUAL_COUNT = 30
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
@@ -33,60 +34,74 @@ def generate(tokenizer, model, text, dynamic_k=None):
     return response, response_ids
 
 def generate_batch(tokenizer, model, prompts, dynamic_k=None):
-    tokens = tokenizer(prompts, return_tensors="pt", padding=True)
-    input_ids = tokens.input_ids.cuda()
-    
-    generate_ids = model.generate(
-        inputs=input_ids,
-        num_beams=1, 
-        bos_token_id=tokenizer.bos_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-        pad_token_id=tokenizer.pad_token_id,
-        dynamic_k=dynamic_k,
-        max_new_tokens=1,
-        top_p=0.9, 
-        temperature=1.0, 
-        do_sample=True
-    )
-    
-    outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
-    
-    # 提取生成部分（去除输入部分）
-    responses = []
-    response_ids = []
-    for i, output in enumerate(outputs):
-        input_length = input_ids.shape[1]  # 统一的输入长度
-        response = output[input_length:]  # 跳过输入部分
-        responses.append(response)
-        response_ids.append(generate_ids[i, input_length:])  # 提取生成的token IDs
-    
-    return responses, torch.stack(response_ids)
+    try:
+        with torch.no_grad():
+            tokens = tokenizer(prompts, return_tensors="pt", padding=True)
+            input_ids = tokens.input_ids.cuda()
+            
+            generate_ids = model.generate(
+                inputs=input_ids,
+                num_beams=1, 
+                bos_token_id=tokenizer.bos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                dynamic_k=dynamic_k,
+                max_new_tokens=1,
+                top_p=0.9, 
+                temperature=1.0, 
+                do_sample=True
+            )
+            
+            outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        
+            # 提取生成部分（去除输入部分）
+            responses = []
+            response_ids = []
+            for i, output in enumerate(outputs):
+                input_length = input_ids.shape[1]  # 统一的输入长度
+                response = output[input_length:]  # 跳过输入部分
+                responses.append(response)
+                response_ids.append(generate_ids[i, input_length:])  # 提取生成的token IDs
+            
+            return responses, torch.stack(response_ids)
+    except torch.cuda.OutOfMemoryError:
+        # print("CUDA out of memory. Clearing cache and returning empty results.")
+        torch.cuda.empty_cache()
+        return [], torch.empty(0)  # 返回空结果
 
-def calculate_batch_loss(tokenizer, model, prompts, labels):
-    with torch.no_grad():
-        # 获取模型输出
-        outputs = model.saved_logits[0]  # [batch_size, seq_len, vocab_size]
-        
-        # 批量tokenize输入
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True)
-        input_ids = inputs.input_ids.cuda()
-        
-        # 构造 shift_logits 和 shift_labels
-        shift_logits = outputs[..., :-1, :].contiguous().float()
-        shift_labels = input_ids[..., 1:].contiguous()
-        
-        # 计算 loss
-        loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=tokenizer.pad_token_id)
-        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1)).view(shift_labels.size())
-        
-        # 计算有效长度
-        lens = (input_ids != tokenizer.pad_token_id).sum(-1).cpu().numpy()
-        
-        # 计算平均 loss
-        ce_loss = loss.float().sum(-1).cpu().detach().numpy() / lens
-        
-        return ce_loss.mean()
+def calculate_batch_loss(tokenizer, model, prompts, labels, isOOM):
+    if isOOM:
+        # print(f"ce_loss.mean(): 1000")
+        return 1000
+    try:
+        with torch.no_grad():
+            # 获取模型输出
+            outputs = model.saved_logits[0]  # [batch_size, seq_len, vocab_size]
+            
+            # 批量tokenize输入
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True)
+            input_ids = inputs.input_ids.cuda()
+            
+            # 构造 shift_logits 和 shift_labels
+            shift_logits = outputs[..., :-1, :].contiguous().float()
+            shift_labels = input_ids[..., 1:].contiguous()
+            
+            # 计算 loss
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=tokenizer.pad_token_id)
+            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)).view(shift_labels.size())
+            
+            # 计算有效长度
+            lens = (input_ids != tokenizer.pad_token_id).sum(-1).cpu().numpy()
+            
+            # 计算平均 loss
+            ce_loss = loss.float().sum(-1).cpu().detach().numpy() / lens
+            # print(f"ce_loss.mean(): {ce_loss.mean()}")
+            return ce_loss.mean()
+    except torch.cuda.OutOfMemoryError:
+        # print("CUDA out of memory in calculate_batch_loss. Clearing cache and returning empty results.")
+        torch.cuda.empty_cache()
+        return 1000
     
 def find_pattern(output_ids):
     # 定义目标模式
@@ -132,8 +147,8 @@ def analysis_piqa(line_json, line_label):
     return prompt
 
 def random_n_dataset(file_json, file_label):
-    output_data = '/home/cyx/datasets/piqa/sampled_30_data.jsonl'
-    output_label = '/home/cyx/datasets/piqa/sampled_30_labels.lst'
+    output_data = '/root/datasets/piqa/sampled_30_data.jsonl'
+    output_label = '/root/datasets/piqa/sampled_30_labels.lst'
 
     # 读取数据和标签，并构建成 pairs
     with open(file_json, 'r', encoding='utf-8') as f_json, \
@@ -144,7 +159,7 @@ def random_n_dataset(file_json, file_label):
             for data_line, label_line in zip(f_json, f_label)
             if data_line.strip() and label_line.strip()
         ]
-    sampled_pairs = random.sample(pairs, MAX_DATASET_COUNT)
+    sampled_pairs = random.sample(pairs, MAX_DATASET_COUNT*MAX_DATASET_EPOCHS)
 
     with open(output_data, 'w', encoding='utf-8') as f_data, \
         open(output_label, 'w', encoding='utf-8') as f_label:
@@ -171,11 +186,11 @@ if __name__ == "__main__":
         model_path,
         from_tf=False,
         config=model_config,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
         low_cpu_mem_usage=True
     ).cuda()
     model.eval()
-
+    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
     hidden_layers = 0
     with open('/root/models/Dynamic_MoE/config.json', 'r', encoding='utf-8') as file:
         data = json.load(file)
@@ -183,18 +198,19 @@ if __name__ == "__main__":
 
     file_json = '/root/datasets/piqa/train.jsonl'   # 第一个文件路径
     file_label = '/root/datasets/piqa/train-labels.lst'  # 第二个文件路径
-    # file_json, file_label = random_n_dataset(file_json, file_label)
+    file_json, file_label = random_n_dataset(file_json, file_label)
 
-    # print(file_json, file_label,)
+    print(file_json, file_label,)
     # 抽取N条保存为另一个文件中
 
     # ga = GeneticAlgorithm(60, 32*3) # 24代表有24层，3代表每一层可以从000-111（二进制转化后为0-7）个专家中选择
-    ga = GeneticAlgorithm(30, 24) # 24代表有24层
+    ga = GeneticAlgorithm(INDIVIDUAL_COUNT, 24) # 24代表有24层
     pop = ga.pop
     print(f"--------------begin iterations at {now} ---------------------")
     for gen_count in range(N_GENERATIONS):  # 迭代N代
         expert_list = ga.translateDNA()
         loss_list = []
+        oomCount = 0
         
         with open(file_json, 'r', encoding='utf-8') as fj, \
             open(file_label, 'r', encoding='utf-8') as fl:
@@ -213,6 +229,8 @@ if __name__ == "__main__":
                 epochs_data.append(epoch_data)
             
             for i, experts in enumerate(expert_list):
+                now1 = datetime.now().strftime("%Y%m%d_%H%M%S")
+                print(f"expert {i} begin training, at time {now1}")
                 # 批量处理所有数据
                 epoch_losses = []
 
@@ -229,14 +247,33 @@ if __name__ == "__main__":
                     responses, output_ids = generate_batch(tokenizer, model, prompts, experts.tolist())
                     
                     # 批量计算loss
-                    batch_loss = calculate_batch_loss(tokenizer, model, prompts, labels)
-                    epoch_losses.append(batch_loss)
+                    isOOM = False
+                    if len(responses) == 0:
+                        isOOM = True
+                        oomCount += 1
+                    batch_loss = calculate_batch_loss(tokenizer, model, prompts, labels, isOOM)
+                    if batch_loss < 1000:
+                        epoch_losses.append(batch_loss)
                     
                     # 清理缓存
                     model.saved_logits = []
                     model.collected_hidden_states = []
+                    # 解决3次interation之后内存不够的问题
+                    if hasattr(model, 'past_key_values'):
+                        del model.past_key_values
+                    torch.cuda.empty_cache()
 
-                loss_list.append(np.mean(epoch_losses))
+                # print(f"epoch_losses: {epoch_losses}")
+                if len(epoch_losses) == 0:
+                    loss_list.append(1000)
+                else:
+                    loss_list.append(np.mean(epoch_losses))
+        
+        if oomCount > INDIVIDUAL_COUNT*MAX_DATASET_EPOCHS/4:
+            with open(file, 'a') as f:
+                f.write(f"jump this interation {gen_count} due to frequant CUDA OOM\n")
+            print("jump this interation due to frequant CUDA OOM")
+            continue
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"generation No. {gen_count}, time {now}: ")
         fitness = ga.get_fitness(np.array(loss_list))

@@ -159,6 +159,8 @@ class GeneticAlgorithm:
         with open(file, 'a') as f:
             f.write(to_write)
         return
+    
+    
 
     
 
