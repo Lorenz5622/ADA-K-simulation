@@ -6,10 +6,9 @@ from mpl_toolkits.mplot3d import Axes3D
 import torch.nn.functional
 DNA_SIZE = 24
 POP_SIZE = 80
-CROSSOVER_RATE = 0.6
-MUTATION_RATE = 0.005
 N_GENERATIONS = 100
 MAX_EXPERT = 7
+MAX_MUTATION = 0.5
 DIFF_K = 4
 np.set_printoptions(threshold=np.inf, linewidth=200)
 class GeneticAlgorithm:
@@ -95,10 +94,18 @@ class GeneticAlgorithm:
                 # 如果所有个体都是精英（罕见情况），则随机选择
                 selected_indices = np.random.choice(np.arange(self.POP_size), size=remaining_count, replace=True)
                 selected_individuals = [self.pop[i] for i in selected_indices]
+                selected_fitness = [inv_fitness[i] for i in selected_indices]
         else:
             selected_individuals = []
+            selected_fitness = []
         # 对selected_individuals进行交叉变异
-        selected_individuals = self.crossover_and_mutation(np.array(selected_individuals), cross_rate, mutation_rate )
+        selected_individuals = self.crossover_and_mutation(
+            np.array(selected_individuals), 
+            fitness_values=np.array(selected_fitness) if selected_fitness else None,
+            CROSSOVER_RATE=cross_rate, 
+            base_mutation_rate=cross_rate,
+            max_mutation_rate=MAX_MUTATION
+        )
         
         new_pop = elite_individuals + selected_individuals
         self.pop = np.array(new_pop[:self.POP_size])

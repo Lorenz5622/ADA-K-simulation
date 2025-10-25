@@ -58,7 +58,7 @@ def run_inference_on_gpu(gpu_id, model_path, input_text, dynamic_k):
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
             dynamic_k=dynamic_k,
-            max_new_tokens=10,
+            max_new_tokens=100,
             do_sample=True
         )
     
@@ -151,5 +151,5 @@ if __name__ == "__main__":
     
     # print("\n=== 模型推理多GPU演示 ===")
     # # 注意：如果你要运行模型推理演示，需要确保模型路径正确
-    # parallel_inference_demo()
+    parallel_inference_demo()
     print(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

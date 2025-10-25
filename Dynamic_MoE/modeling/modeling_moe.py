@@ -219,7 +219,7 @@ class SwitchMLP(nn.Module):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
         # print(f"chosen k: {chosen_k}")
-        if chosen_k == 0:
+        if int(chosen_k) == 0:
             return hidden_states
         
         route = self.router(hidden_states)
@@ -227,7 +227,8 @@ class SwitchMLP(nn.Module):
         
 
         # topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
-        topk_weights, topk_ind = torch.topk(route, chosen_k)
+        # print(chosen_k)
+        topk_weights, topk_ind = torch.topk(route, int(chosen_k))
         # print(chosen_k)
 
         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 

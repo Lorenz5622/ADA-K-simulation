@@ -12,10 +12,10 @@ from datetime import datetime
 N_GENERATIONS = 500
 CROSSOVER_RATE = 0.4
 MUTATION_RATE = 0.05
-MAX_DATASET_COUNT = 150
-MAX_DATASET_EPOCHS = 40
+MAX_DATASET_COUNT = 50
+MAX_DATASET_EPOCHS = 120
 INDIVIDUAL_COUNT = 30
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -147,8 +147,8 @@ def analysis_piqa(line_json, line_label):
     return prompt
 
 def random_n_dataset(file_json, file_label):
-    output_data = '/root/datasets/piqa/sampled_30_data.jsonl'
-    output_label = '/root/datasets/piqa/sampled_30_labels.lst'
+    output_data = '/home/cyx/datasets/piqa/sampled_30_data.jsonl'
+    output_label = '/home/cyx/datasets/piqa/sampled_30_labels.lst'
 
     # 读取数据和标签，并构建成 pairs
     with open(file_json, 'r', encoding='utf-8') as f_json, \
@@ -173,7 +173,7 @@ def random_n_dataset(file_json, file_label):
     return output_data, output_label
 
 if __name__ == "__main__":
-    model_path = '/root/models/Dynamic_MoE'
+    model_path = '/home/cyx/models/Dynamic_MoE'
     now = datetime.now().strftime("%Y%m%d_%H%M%S")  # 例如：20251007_213015
 
     # 构造文件名
@@ -192,12 +192,12 @@ if __name__ == "__main__":
     model.eval()
     model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
     hidden_layers = 0
-    with open('/root/models/Dynamic_MoE/config.json', 'r', encoding='utf-8') as file:
+    with open('/home/cyx/models/Dynamic_MoE/config.json', 'r', encoding='utf-8') as file:
         data = json.load(file)
         hidden_layers = data['num_hidden_layers']
 
-    file_json = '/root/datasets/piqa/train.jsonl'   # 第一个文件路径
-    file_label = '/root/datasets/piqa/train-labels.lst'  # 第二个文件路径
+    file_json = '/home/cyx/datasets/piqa/train.jsonl'   # 第一个文件路径
+    file_label = '/home/cyx/datasets/piqa/train-labels.lst'  # 第二个文件路径
     file_json, file_label = random_n_dataset(file_json, file_label)
 
     print(file_json, file_label,)
@@ -280,7 +280,12 @@ if __name__ == "__main__":
         ga.print_info()
         if gen_count % 10 == 0:
             ga.write_to_record(record_file, gen_count)
-        pop = ga.select()  # 选择生成新的种群
+        pop = ga.select(
+            elite_rate= 0.1, 
+            diversity_threshold = 0.3, 
+            cross_rate=CROSSOVER_RATE, 
+            mutation_rate=MUTATION_RATE
+        )  # 选择生成新的种群
 
 
         
