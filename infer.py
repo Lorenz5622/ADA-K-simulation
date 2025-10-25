@@ -11,9 +11,15 @@ import os
 from datetime import datetime
 N_GENERATIONS = 500
 CROSSOVER_RATE = 0.4
+<<<<<<< HEAD
 MUTATION_RATE = 0.05
 MAX_DATASET_COUNT = 50
 MAX_DATASET_EPOCHS = 120
+=======
+MUTATION_RATE = 0.03
+MAX_DATASET_COUNT = 150
+MAX_DATASET_EPOCHS = 35
+>>>>>>> d525a148efc241e215a7508e373d0e817cf6f2bf
 INDIVIDUAL_COUNT = 30
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 def generate(tokenizer, model, text, dynamic_k=None):
@@ -281,10 +287,17 @@ if __name__ == "__main__":
         if gen_count % 10 == 0:
             ga.write_to_record(record_file, gen_count)
         pop = ga.select(
+<<<<<<< HEAD
             elite_rate= 0.1, 
             diversity_threshold = 0.3, 
             cross_rate=CROSSOVER_RATE, 
             mutation_rate=MUTATION_RATE
+=======
+            elite_rate = 0.1,
+            diversity_threshold = 0.3,
+            cross_rate = CROSSOVER_RATE,
+            mutation_rate = MUTATION_RATE
+>>>>>>> d525a148efc241e215a7508e373d0e817cf6f2bf
         )  # 选择生成新的种群
 
 
