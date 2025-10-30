@@ -9,7 +9,7 @@ POP_SIZE = 80
 N_GENERATIONS = 100
 MAX_EXPERT = 7
 MAX_MUTATION = 0.5
-DIFF_K = 4
+DIFF_K = 3
 np.set_printoptions(threshold=np.inf, linewidth=200)
 class GeneticAlgorithm:
     def __init__(self, pop_size, length):
@@ -45,29 +45,26 @@ class GeneticAlgorithm:
 
         return new_pop
     
-    def crossover_and_mutation(self, pops, CROSSOVER_RATE=0.8, MUTATION_RATE=0.01):
+    def crossover_and_mutation(self, pops, CROSSOVER_RATE=0.8, MUTATION_RATE=0.01, max_inv_fitness=0.01, avg_inv_fitness=0.01):
         new_pop = []
         pop_size = len(pops)
-        
-        # 计算适应度值用于动态调整参数
-        if self.fitness is not None:
-            inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
-        else:
-            inv_fitness = np.ones(pop_size)
-        
-        # 计算最大适应度和平均适应度
-        max_inv_fitness = np.max(inv_fitness)
-        avg_inv_fitness = np.mean(inv_fitness)
+        diversity = self.calculate_diversity()
+        inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
+        inv_fitness = inv_fitness / inv_fitness.sum()
+        # # 计算最大适应度和平均适应度
+        # max_inv_fitness = np.max(inv_fitness)
+        # avg_inv_fitness = np.mean(inv_fitness)
         
         for idx, father in enumerate(pops):
             child = father.copy()
-
+            isCross = False
             # 交叉操作
             if np.random.rand() < CROSSOVER_RATE:
                 mother_idx = np.random.randint(pop_size)
                 mother = pops[mother_idx].copy()
                 
                 # 计算交叉率
+                isCross = True
                 if max_inv_fitness > avg_inv_fitness:  # 防止除零错误
                     # 取两个个体中适应度较高的那个
                     max_father_mother_fitness = max(inv_fitness[idx], inv_fitness[mother_idx])
@@ -85,14 +82,21 @@ class GeneticAlgorithm:
 
             # 计算个体变异率
             if max_inv_fitness > avg_inv_fitness:  # 防止除零错误
-                
-                if inv_fitness[idx] >= avg_inv_fitness:
-                    individual_mutation_rate = MUTATION_RATE*(max_inv_fitness - inv_fitness[idx]) / (max_inv_fitness - avg_inv_fitness)
+                if isCross is False:
+                    if inv_fitness[idx] >= avg_inv_fitness:
+                        individual_mutation_rate = MUTATION_RATE*(max_inv_fitness - inv_fitness[idx]) / (max_inv_fitness - avg_inv_fitness)
+                    else:
+                        individual_mutation_rate = MUTATION_RATE
                 else:
                     individual_mutation_rate = MUTATION_RATE
+                # else:
+                #     if diversity < 0.4:
+                #         individual_mutation_rate = MUTATION_RATE
+                #     else:
+                #         individual_mutation_rate = MUTATION_RATE/2
             else:
                 individual_mutation_rate = MUTATION_RATE
-            print(f"inv_fitness[idx]: {inv_fitness[idx]}, mutation rate: {individual_mutation_rate}")
+            # print(f"child: {child}, inv_fitness: {inv_fitness[idx]}, mutation rate: {individual_mutation_rate}")
                 
             # 应用变异操作
             child = self.mutation(child, MUTATION_RATE=individual_mutation_rate)
@@ -120,10 +124,12 @@ class GeneticAlgorithm:
     
     def select(self, elite_rate= 0.1, diversity_threshold = 0.3, cross_rate=0.8, mutation_rate=0.01):  # nature selection wrt pop's fitness
         inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
+        inv_fitness = inv_fitness / inv_fitness.sum()
         elite_count = max(1, int(self.POP_size * elite_rate))
-        elite_indices = np.argsort(inv_fitness)[:elite_count]
+        elite_indices = np.argsort(inv_fitness)[-elite_count:]
         elite_individuals = [self.pop[i].copy() for i in elite_indices]
-        # print(elite_individuals)
+        print("elite_individuals: ")
+        print(elite_individuals)
         diversity = self.calculate_diversity()
         if diversity < diversity_threshold:
             # 在选择过程中增加随机性，避免过早收敛
@@ -155,22 +161,20 @@ class GeneticAlgorithm:
             selected_individuals = []
             selected_fitness = []
         # 对selected_individuals进行交叉变异
+        avg_fitness = np.mean(inv_fitness)
+        max_fitness = np.max(inv_fitness)
         selected_individuals = self.crossover_and_mutation(
             np.array(selected_individuals), 
-<<<<<<< HEAD
-            fitness_values=np.array(selected_fitness) if selected_fitness else None,
             CROSSOVER_RATE=cross_rate, 
-            base_mutation_rate=cross_rate,
-            max_mutation_rate=MAX_MUTATION
-=======
-            CROSSOVER_RATE=cross_rate, 
-            MUTATION_RATE=mutation_rate
->>>>>>> d525a148efc241e215a7508e373d0e817cf6f2bf
+            MUTATION_RATE=mutation_rate,
+            max_inv_fitness=max_fitness, 
+            avg_inv_fitness=avg_fitness
         )
         
         new_pop = elite_individuals + selected_individuals
         self.pop = np.array(new_pop[:self.POP_size])
-        # print(self.pop)
+        print("self.pop: ")
+        print(self.pop)
         return self.pop
     
     
@@ -194,7 +198,7 @@ class GeneticAlgorithm:
         # 平均汉明距离除以基因长度，得到归一化的多样性度量
         avg_distance = total_distance / count if count > 0 else 0
         normalized_diversity = avg_distance / self.DNA_size
-        
+        print(f"diversity: {normalized_diversity}")
         return normalized_diversity
     
     def print_info(self):

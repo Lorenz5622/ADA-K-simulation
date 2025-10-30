@@ -10,18 +10,12 @@ import numpy as np
 import os
 from datetime import datetime
 N_GENERATIONS = 500
-CROSSOVER_RATE = 0.4
-<<<<<<< HEAD
-MUTATION_RATE = 0.05
-MAX_DATASET_COUNT = 50
-MAX_DATASET_EPOCHS = 120
-=======
+CROSSOVER_RATE = 0.5
 MUTATION_RATE = 0.03
-MAX_DATASET_COUNT = 150
+MAX_DATASET_COUNT = 60
 MAX_DATASET_EPOCHS = 35
->>>>>>> d525a148efc241e215a7508e373d0e817cf6f2bf
 INDIVIDUAL_COUNT = 30
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -183,7 +177,7 @@ if __name__ == "__main__":
     now = datetime.now().strftime("%Y%m%d_%H%M%S")  # 例如：20251007_213015
 
     # 构造文件名
-    record_file = f"output_{now}.txt"
+    record_file = f"records/output_{now}.txt"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -276,7 +270,7 @@ if __name__ == "__main__":
                     loss_list.append(np.mean(epoch_losses))
         
         if oomCount > INDIVIDUAL_COUNT*MAX_DATASET_EPOCHS/4:
-            with open(file, 'a') as f:
+            with open(record_file, 'a') as f:
                 f.write(f"jump this interation {gen_count} due to frequant CUDA OOM\n")
             print("jump this interation due to frequant CUDA OOM")
             continue
@@ -284,20 +278,13 @@ if __name__ == "__main__":
         print(f"generation No. {gen_count}, time {now}: ")
         fitness = ga.get_fitness(np.array(loss_list))
         ga.print_info()
-        if gen_count % 10 == 0:
-            ga.write_to_record(record_file, gen_count)
+        # if gen_count % 2 == 0:
+        #     ga.write_to_record(record_file, gen_count)
         pop = ga.select(
-<<<<<<< HEAD
-            elite_rate= 0.1, 
-            diversity_threshold = 0.3, 
-            cross_rate=CROSSOVER_RATE, 
-            mutation_rate=MUTATION_RATE
-=======
             elite_rate = 0.1,
             diversity_threshold = 0.3,
             cross_rate = CROSSOVER_RATE,
             mutation_rate = MUTATION_RATE
->>>>>>> d525a148efc241e215a7508e373d0e817cf6f2bf
         )  # 选择生成新的种群
 
 
