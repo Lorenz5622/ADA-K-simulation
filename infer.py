@@ -10,12 +10,12 @@ import numpy as np
 import os
 from datetime import datetime
 N_GENERATIONS = 500
-CROSSOVER_RATE = 0.5
-MUTATION_RATE = 0.03
+CROSSOVER_RATE = 0.7
+MUTATION_RATE = 0.05
 MAX_DATASET_COUNT = 60
-MAX_DATASET_EPOCHS = 35
+MAX_DATASET_EPOCHS = 1
 INDIVIDUAL_COUNT = 30
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -147,8 +147,8 @@ def analysis_piqa(line_json, line_label):
     return prompt
 
 def random_n_dataset(file_json, file_label):
-    output_data = '/home/cyx/datasets/piqa/sampled_30_data.jsonl'
-    output_label = '/home/cyx/datasets/piqa/sampled_30_labels.lst'
+    output_data = f'/home/cyx/datasets/piqa/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_data.jsonl'
+    output_label = f'/home/cyx/datasets/piqa/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_labels.lst'
 
     # 读取数据和标签，并构建成 pairs
     with open(file_json, 'r', encoding='utf-8') as f_json, \
@@ -278,8 +278,8 @@ if __name__ == "__main__":
         print(f"generation No. {gen_count}, time {now}: ")
         fitness = ga.get_fitness(np.array(loss_list))
         ga.print_info()
-        # if gen_count % 2 == 0:
-        #     ga.write_to_record(record_file, gen_count)
+        if gen_count % 2 == 0:
+            ga.write_to_record(record_file, gen_count)
         pop = ga.select(
             elite_rate = 0.1,
             diversity_threshold = 0.3,

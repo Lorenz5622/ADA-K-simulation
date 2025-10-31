@@ -1,0 +1,4 @@
+jump this interation 0 due to frequant CUDA OOM
+jump this interation 1 due to frequant CUDA OOM
+jump this interation 2 due to frequant CUDA OOM
+jump this interation 3 due to frequant CUDA OOM

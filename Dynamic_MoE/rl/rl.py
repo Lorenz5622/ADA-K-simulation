@@ -9,14 +9,14 @@ POP_SIZE = 80
 N_GENERATIONS = 100
 MAX_EXPERT = 7
 MAX_MUTATION = 0.5
-DIFF_K = 3
+DIFF_K = 4
 np.set_printoptions(threshold=np.inf, linewidth=200)
 class GeneticAlgorithm:
     def __init__(self, pop_size, length):
         self.DNA_size = length
         self.POP_size = pop_size
         self.fitness = None
-        self.pop = np.random.randint(8, size=(self.POP_size, self.DNA_size))
+        self.pop = np.random.randint(7, size=(self.POP_size, self.DNA_size))
     
     def F(self, x, label):
         return torch.nn.functional.cross_entropy(x, label)
@@ -51,6 +51,8 @@ class GeneticAlgorithm:
         diversity = self.calculate_diversity()
         inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
         inv_fitness = inv_fitness / inv_fitness.sum()
+        vari = np.var(inv_fitness)
+        print(f"方差：{vari}")
         # # 计算最大适应度和平均适应度
         # max_inv_fitness = np.max(inv_fitness)
         # avg_inv_fitness = np.mean(inv_fitness)
@@ -88,7 +90,7 @@ class GeneticAlgorithm:
                     else:
                         individual_mutation_rate = MUTATION_RATE
                 else:
-                    individual_mutation_rate = MUTATION_RATE
+                    individual_mutation_rate = MUTATION_RATE/2
                 # else:
                 #     if diversity < 0.4:
                 #         individual_mutation_rate = MUTATION_RATE
