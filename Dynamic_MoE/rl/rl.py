@@ -51,8 +51,7 @@ class GeneticAlgorithm:
         diversity = self.calculate_diversity()
         inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
         inv_fitness = inv_fitness / inv_fitness.sum()
-        vari = np.var(inv_fitness)
-        print(f"方差：{vari}")
+        print(f"diversity{diversity}")
         # # 计算最大适应度和平均适应度
         # max_inv_fitness = np.max(inv_fitness)
         # avg_inv_fitness = np.mean(inv_fitness)
@@ -136,11 +135,15 @@ class GeneticAlgorithm:
         if diversity < diversity_threshold:
             # 在选择过程中增加随机性，避免过早收敛
             # 添加一些随机个体到选择池中
-            random_count = max(1, int(self.POP_size * 0.1))
-            random_indices = np.random.choice(np.arange(self.POP_size), size=random_count, replace=False)
-            elite_indices = np.concatenate([elite_indices, random_indices])
-            elite_indices = np.unique(elite_indices)
-            elite_individuals = [self.pop[i].copy() for i in elite_indices]
+            random_count = max(1, int(self.POP_size * 0.15))
+            # random_indices = np.random.choice(np.arange(self.POP_size), size=random_count, replace=False)
+            random_pop = np.random.randint(7, size=(random_count, self.DNA_size)).tolist()
+            print(f"before random pop: {elite_individuals}")
+            elite_individuals += random_pop
+            print(f"after random pop: {elite_individuals}")
+            # elite_indices = np.concatenate([elite_indices, random_indices])
+            # elite_indices = np.unique(elite_indices)
+            # elite_individuals = [self.pop[i].copy() for i in elite_indices]
 
         remaining_count = self.POP_size - len(elite_individuals)
         probs = inv_fitness / inv_fitness.sum()
@@ -166,7 +169,7 @@ class GeneticAlgorithm:
         avg_fitness = np.mean(inv_fitness)
         max_fitness = np.max(inv_fitness)
         selected_individuals = self.crossover_and_mutation(
-            np.array(selected_individuals), 
+            np.array(self.pop), 
             CROSSOVER_RATE=cross_rate, 
             MUTATION_RATE=mutation_rate,
             max_inv_fitness=max_fitness, 
@@ -187,21 +190,21 @@ class GeneticAlgorithm:
         if self.POP_size <= 1:
             return 0.0
         
-        total_distance = 0
-        count = 0
+        # total_distance = 0
+        # count = 0
         
-        # 计算所有个体对之间的汉明距离
-        for i in range(self.POP_size):
-            for j in range(i+1, self.POP_size):
-                distance = np.sum(self.pop[i] != self.pop[j])
-                total_distance += distance
-                count += 1
+        # # 计算所有个体对之间的汉明距离
+        # for i in range(self.POP_size):
+        #     for j in range(i+1, self.POP_size):
+        #         distance = np.sum(self.pop[i] != self.pop[j])
+        #         total_distance += distance
+        #         count += 1
         
-        # 平均汉明距离除以基因长度，得到归一化的多样性度量
-        avg_distance = total_distance / count if count > 0 else 0
-        normalized_diversity = avg_distance / self.DNA_size
-        print(f"diversity: {normalized_diversity}")
-        return normalized_diversity
+        # # 平均汉明距离除以基因长度，得到归一化的多样性度量
+        # avg_distance = total_distance / count if count > 0 else 0
+        # normalized_diversity = avg_distance / self.DNA_size
+        # print(f"diversity: {normalized_diversity}")
+        return np.std(self.fitness)/np.mean(self.fitness)
     
     def print_info(self):
         inv_fitness = 1.0 / (np.array(self.fitness) ** DIFF_K)
