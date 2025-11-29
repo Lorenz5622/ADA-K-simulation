@@ -7,7 +7,7 @@ import torch.nn.functional
 DNA_SIZE = 24
 POP_SIZE = 80
 N_GENERATIONS = 100
-MAX_EXPERT = 7
+MAX_EXPERT = 6
 MAX_MUTATION = 0.5
 DIFF_K = 4
 np.set_printoptions(threshold=np.inf, linewidth=200)
@@ -16,7 +16,7 @@ class GeneticAlgorithm:
         self.DNA_size = length
         self.POP_size = pop_size
         self.fitness = None
-        self.pop = np.random.randint(7, size=(self.POP_size, self.DNA_size))
+        self.pop = np.random.randint(MAX_EXPERT, size=(self.POP_size, self.DNA_size))
     
     def F(self, x, label):
         return torch.nn.functional.cross_entropy(x, label)
@@ -144,6 +144,20 @@ class GeneticAlgorithm:
             # elite_indices = np.concatenate([elite_indices, random_indices])
             # elite_indices = np.unique(elite_indices)
             # elite_individuals = [self.pop[i].copy() for i in elite_indices]
+
+        unique_elite_individuals = []
+        for individual in elite_individuals:
+            is_duplicate = False
+            for unique_individual in unique_elite_individuals:
+                if np.array_equal(individual, unique_individual):
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_elite_individuals.append(individual)
+        
+        elite_individuals = unique_elite_individuals
+        print("unique elite_individuals: ")
+        print(elite_individuals)
 
         remaining_count = self.POP_size - len(elite_individuals)
         probs = inv_fitness / inv_fitness.sum()

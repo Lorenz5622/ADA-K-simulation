@@ -578,7 +578,7 @@ class MoEModel(MoEPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        dynamic_k: List[int] = None,
+        # dynamic_k: List[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -672,7 +672,7 @@ class MoEModel(MoEPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    chosen_k=dynamic_k[idx],
+                    # chosen_k=dynamic_k[idx],
                 )
 
             hidden_states = layer_outputs[0]
@@ -755,7 +755,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        dynamic_k: List[int] = None,
+        # dynamic_k: List[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -801,7 +801,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            dynamic_k=dynamic_k,
+            # dynamic_k=dynamic_k,
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
@@ -876,7 +876,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
                 "past_key_values": past_key_values,
                 "use_cache": kwargs.get("use_cache"),
                 "attention_mask": attention_mask,
-                "dynamic_k": kwargs.get("dynamic_k"),
+                # "dynamic_k": kwargs.get("dynamic_k"),
             }
         )
         return model_inputs
@@ -1055,26 +1055,6 @@ class ExpertSelector(nn.Module):
         
         return probs, selected_experts_num
     
-    # def get_top_k_experts(self, hidden_states, k=2):
-    #     """
-    #     获取top-k专家而不是采样
-        
-    #     Args:
-    #         hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
-    #         k: 选择的专家数量
-            
-    #     Returns:
-    #         topk_probs: top-k专家的概率 [batch_size, seq_len, k]
-    #         topk_indices: top-k专家的索引 [batch_size, seq_len, k]
-    #     """
-    #     router_logits = self.router(hidden_states)
-    #     probs = torch.nn.functional.softmax(router_logits, dim=-1)
-        
-    #     # 获取top-k专家
-    #     topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
-        
-    #     return topk_probs, topk_indices
-    
     def compute_routing_entropy(self, hidden_states):
         """
         计算路由熵，衡量专家选择的多样性
@@ -1116,74 +1096,57 @@ class EnhancedSwitchMLP(nn.Module):
         if not self.use_switch:
             return self.mlp(hidden_states)
         
-        if use_sampling:
-            # 使用采样方式选择专家
-            
-            
-            # 根据采样的专家进行处理
-            # output = self.process_with_selected_experts(hidden_states, selected_experts)
 
-            # 原样复制switchMLP
-            if not self.use_switch:
-                output = self.mlp(hidden_states)
-                return output
+        # 原样复制switchMLP
+        if not self.use_switch:
+            output = self.mlp(hidden_states)
+            return output
 
-            s = hidden_states.size(0)
-            b = hidden_states.size(1)
-            h = hidden_states.size(2)
-            # print(f"chosen k: {chosen_k}")
-            # if int(chosen_k) == 0:
-            #     return hidden_states
-            print(f"hidden_states.shape: {hidden_states.shape}")
-            
-            # route = self.router(hidden_states)
-            # print(f"route.shape: {route.shape}")
-            # route = torch.nn.functional.softmax(route, dim=2)
-            
+        s = hidden_states.size(0)
+        b = hidden_states.size(1)
+        h = hidden_states.size(2)
+        print(f"hidden_states.shape: {hidden_states.shape}")
 
-            # topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
-            # print(chosen_k)
-            # 使用采样得到的top-k值进行专家选择
-            probs, sampled_k  = self.expert_selector(hidden_states)
-            route = self.router(hidden_states)
-            route = torch.nn.functional.softmax(route, dim=2)
-            topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
-            
-            # 创建填充到最大专家数的矩阵
-            max_experts = self.num_experts
-            padded_topk_indices = torch.full((s, b, max_experts), -1, device=route.device)
-            padded_topk_weights = torch.zeros((s, b, max_experts), device=route.device)
-            
-            padded_topk_indices[:, :, :sampled_k] = topk_indices
-            padded_topk_weights[:, :, :sampled_k] = topk_weights
-            
-            topk_ind = padded_topk_indices
-            topk_weights = padded_topk_weights
-            
-            # print(chosen_k)
+        # 使用采样得到的top-k值进行专家选择
+        probs, sampled_k  = self.expert_selector(hidden_states)
+        route = self.router(hidden_states)
+        route = torch.nn.functional.softmax(route, dim=2)
+        # topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
+        batch_size, num_rows, num_candidates = route.shape  # (1, 8, 16)
+        topk_indices = torch.full((batch_size, num_rows, num_candidates), -1, dtype=torch.long, device=route.device)
+        mask = torch.full((batch_size, num_rows, num_candidates), True, dtype=torch.bool, device=route.device)
+        for i in range(batch_size):
+            for j in range(num_rows):
+                k = sampled_k[i, j].item()
+                if k == 0:
+                    continue  # 全为 -1
+                # 取 top-k 最大的索引（注意：torch.topk 默认 descending=True）
+                topk_idxs = torch.topk(route[i, j], k, largest=True, sorted=True).indices
+                topk_indices[i, j, :k] = topk_idxs
+                for expert_idx in topk_idxs:
+                    mask[i, j, expert_idx] = False
 
-            hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
-            topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
-            topk_ind = topk_ind.view(-1, topk_ind.size(2))
+        
+        topk_ind = topk_indices
+        topk_weights = torch.where(mask, 0.0, route)
+        
+        # print(chosen_k)
 
-            output_total = torch.zeros_like(hidden_states).to(hidden_states)
-            for expert_num, expert in enumerate(self.experts):
-                sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-                hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-                expert_output = expert(hidden)
-                output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
+        hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
+        topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
+        topk_ind = topk_ind.view(-1, topk_ind.size(2))
+
+        output_total = torch.zeros_like(hidden_states).to(hidden_states)
+        for expert_num, expert in enumerate(self.experts):
+            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
+            hidden = hidden_states[sample_ind.unsqueeze(1), :] 
+            expert_output = expert(hidden)
+            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
 
-            output_total = output_total.view(s, b, h)
-            return output_total
-        # else:
-        #     # 使用top-k方式选择专家
-        #     topk_probs, topk_indices = self.expert_selector.get_top_k_experts(hidden_states, k=2)
+        output_total = output_total.view(s, b, h)
+        return output_total
             
-        #     # 根据top-k专家进行处理
-        #     output = self.process_with_topk_experts(hidden_states, topk_probs, topk_indices)
-            
-        return output
     
     
     def process_with_selected_experts(self, hidden_states, selected_experts):
@@ -1207,30 +1170,3 @@ class EnhancedSwitchMLP(nn.Module):
         
         return output.view(batch_size, seq_len, hidden_size)
     
-    # def process_with_topk_experts(self, hidden_states, topk_probs, topk_indices):
-    #     """
-    #     根据top-k专家处理hidden_states
-    #     """
-    #     batch_size, seq_len, hidden_size = hidden_states.shape
-    #     k = topk_probs.shape[-1]
-        
-    #     hidden_flat = hidden_states.view(-1, hidden_size)
-    #     probs_flat = topk_probs.view(-1, k)
-    #     indices_flat = topk_indices.view(-1, k)
-        
-    #     output = torch.zeros_like(hidden_flat)
-        
-    #     # 处理每个专家
-    #     for expert_idx, expert in enumerate(self.experts):
-    #         # 找到需要该专家处理的位置
-    #         expert_mask = (indices_flat == expert_idx)
-    #         if expert_mask.any():
-    #             # 获取对应的hidden states和权重
-    #             for i in range(k):
-    #                 mask = expert_mask[:, i]
-    #                 if mask.any():
-    #                     expert_output = expert(hidden_flat[mask])
-    #                     weighted_output = expert_output * probs_flat[mask, i].unsqueeze(-1)
-    #                     output[mask] += weighted_output
-        
-    #     return output.view(batch_size, seq_len, hidden_size)

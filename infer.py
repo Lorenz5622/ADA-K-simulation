@@ -10,13 +10,14 @@ import numpy as np
 import os
 from datetime import datetime
 N_GENERATIONS = 500
-CROSSOVER_RATE = 0.6
-MUTATION_RATE = 0.08
-MAX_DATASET_COUNT = 70
-MAX_DATASET_EPOCHS = 30
-INDIVIDUAL_COUNT = 30
+CROSSOVER_RATE = 0.5
+MUTATION_RATE = 0.07
+MAX_DATASET_COUNT = 1
+MAX_DATASET_EPOCHS = 45
+INDIVIDUAL_COUNT = 20
+DATASET = "piqa" # 路径默认为{PATH_PREFIX}/datasets/{DATASET}
 PATH_PREFIX = "/root"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 def generate(tokenizer, model, text, dynamic_k=None):
     inputs = [text]
     tokens = tokenizer(inputs,return_tensors="pt")
@@ -148,8 +149,8 @@ def analysis_piqa(line_json, line_label):
     return prompt
 
 def random_n_dataset(file_json, file_label):
-    output_data = f'{PATH_PREFIX}/datasets/piqa/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_data.jsonl'
-    output_label = f'{PATH_PREFIX}/datasets/piqa/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_labels.lst'
+    output_data = f'{PATH_PREFIX}/datasets/{DATASET}/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_data.jsonl'
+    output_label = f'{PATH_PREFIX}/datasets/{DATASET}/sampled_{MAX_DATASET_COUNT*MAX_DATASET_EPOCHS}_labels.lst'
 
     # 读取数据和标签，并构建成 pairs
     with open(file_json, 'r', encoding='utf-8') as f_json, \
@@ -180,7 +181,7 @@ if __name__ == "__main__":
     now = datetime.now().strftime("%Y%m%d_%H%M%S")  # 例如：20251007_213015
 
     # 构造文件名
-    record_file = f"records/output_{now}.txt"
+    record_file = f"../records/output_{now}.txt"
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 
@@ -199,9 +200,9 @@ if __name__ == "__main__":
         data = json.load(file)
         hidden_layers = data['num_hidden_layers']
 
-    file_json = f'{PATH_PREFIX}/datasets/piqa/train.jsonl'   # 第一个文件路径
-    file_label = f'{PATH_PREFIX}/datasets/piqa/train-labels.lst'  # 第二个文件路径
-    file_json, file_label = random_n_dataset(file_json, file_label)
+    file_json = f'{PATH_PREFIX}/datasets/{DATASET}/train.jsonl'   # 第一个文件路径
+    file_label = f'{PATH_PREFIX}/datasets/{DATASET}/train-labels.lst'  # 第二个文件路径
+    # file_json, file_label = random_n_dataset(file_json, file_label)
 
     print(file_json, file_label,)
     # 抽取N条保存为另一个文件中
