@@ -31,7 +31,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import logging, add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
-
+import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 
 logger = logging.get_logger(__name__)
@@ -346,7 +346,11 @@ class LlamaDecoderLayer(nn.Module):
         #     intermediate_size=config.intermediate_size,
         #     hidden_act=config.hidden_act,
         # )
-        self.mlp = EnhancedSwitchMLP(config, layer_idx)
+        # self.mlp = EnhancedSwitchMLP(config, layer_idx)
+        self.mlp = EnhancedSwitchMLP(
+            config=config,
+            layer_idx=layer_idx,
+        )
         # self.mlp = SwitchMLP(config, layer_idx)
         # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         # self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -397,7 +401,7 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
         # hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.post_attention_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states, chosen_k)
+        hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -741,7 +745,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
     def get_decoder(self):
         return self.model
-    
+    def get_allocator_params(self):
+        params = []
+        for layer in self.model.layers:
+            if hasattr(layer.mlp, "allocator"):
+                params += list(layer.mlp.allocator.parameters())
+        return params
     def ppo_update(self, ppo_batches):
         """
         ppo_batches: 由外部整理好的 PPO 数据
@@ -1211,111 +1220,256 @@ class ExpertSelector(nn.Module):
         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
         return torch.mean(entropy)
 
+
+class AdaKAllocator(nn.Module):
+    """
+    Per-layer allocator W_alloc in the paper.
+    Computes P(k | h) for dynamic top-k expert routing.
+    """
+    def __init__(self, hidden_size, max_k):
+        super().__init__()
+        self.max_k = max_k
+        self.alloc = nn.Linear(hidden_size, max_k)
+
+    def forward(self, hidden_states):
+        """
+        hidden_states: [B,S,H]
+        return:
+            alloc_logits: [B,S,K]
+            alloc_probs:  [B,S,K]
+        """
+        logits = self.alloc(hidden_states)      # [B,S,K]
+        logits = torch.clamp(logits, -30, 30)   # avoid softmax overflow
+        probs = F.softmax(logits, dim=-1)
+        probs = torch.clamp(probs, 1e-8, 1.0)
+        return logits, probs
+
 # 使用示例
-class EnhancedSwitchMLP(nn.Module):
-    """
-    增强版SwitchMLP，使用ExpertSelector进行专家选择
-    """
-    def __init__(self, config, layer_idx):
-        super(EnhancedSwitchMLP, self).__init__()
-        self.layer_num = layer_idx
-        self.use_switch = (layer_idx % config.expert_frequency) == 0
-        self.ppo_trajectory = []
-        if self.use_switch:
-            # 使用新的专家选择器
-            self.expert_selector = ExpertSelector(config)
-            self.experts = torch.nn.ModuleList()
-            self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
-            self.num_experts = config.num_experts
-            for i in range(config.num_experts):
-                self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
-        else:
-            self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+# class EnhancedSwitchMLP(nn.Module):
+#     """
+#     增强版SwitchMLP，使用ExpertSelector进行专家选择
+#     """
+#     def __init__(self, config, layer_idx):
+#         super(EnhancedSwitchMLP, self).__init__()
+#         self.layer_num = layer_idx
+#         self.use_switch = (layer_idx % config.expert_frequency) == 0
+#         self.ppo_trajectory = []
+#         if self.use_switch:
+#             # 使用新的专家选择器
+#             self.expert_selector = ExpertSelector(config)
+#             self.experts = torch.nn.ModuleList()
+#             self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
+#             self.num_experts = config.num_experts
+#             for i in range(config.num_experts):
+#                 self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+#         else:
+#             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
     
-    def forward(self, hidden_states, use_sampling=True):
-        if not self.use_switch:
-            return self.mlp(hidden_states)
+#     def forward(self, hidden_states, use_sampling=True):
+#         if not self.use_switch:
+#             return self.mlp(hidden_states)
         
 
-        # 原样复制switchMLP
-        if not self.use_switch:
-            output = self.mlp(hidden_states)
-            return output
+#         # 原样复制switchMLP
+#         if not self.use_switch:
+#             output = self.mlp(hidden_states)
+#             return output
 
-        s = hidden_states.size(0)
-        b = hidden_states.size(1)
-        h = hidden_states.size(2)
-        # print(f"hidden_states.shape: {hidden_states.shape}")
+#         s = hidden_states.size(0)
+#         b = hidden_states.size(1)
+#         h = hidden_states.size(2)
+#         # print(f"hidden_states.shape: {hidden_states.shape}")
 
-        # 使用采样得到的top-k值进行专家选择
-        probs, sampled_k, ppo_info  = self.expert_selector(hidden_states)
-        ppo_step = {
-            "layer_id": id(self),           # 或者给每层分配 index
-            "state": ppo_info["state"],
-            "action": ppo_info["action"],
-            "log_prob": ppo_info["log_prob"],
-            "pi_prob": ppo_info["pi_prob"],
-        }
-        self.ppo_trajectory.append(ppo_step)
+#         # 使用采样得到的top-k值进行专家选择
+#         probs, sampled_k, ppo_info  = self.expert_selector(hidden_states)
+#         ppo_step = {
+#             "layer_id": id(self),           # 或者给每层分配 index
+#             "state": ppo_info["state"],
+#             "action": ppo_info["action"],
+#             "log_prob": ppo_info["log_prob"],
+#             "pi_prob": ppo_info["pi_prob"],
+#         }
+#         self.ppo_trajectory.append(ppo_step)
 
-        route = self.router(hidden_states)
-        route = torch.nn.functional.softmax(route, dim=2)
-        # topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
-        batch_size, num_rows, num_candidates = route.shape  # (1, 8, 16)
-        topk_indices = torch.full((batch_size, num_rows, num_candidates), -1, dtype=torch.long, device=route.device)
-        mask = torch.full((batch_size, num_rows, num_candidates), True, dtype=torch.bool, device=route.device)
-        for i in range(batch_size):
-            for j in range(num_rows):
-                k = sampled_k[i, j].item()
-                if k == 0:
-                    continue  # 全为 -1
-                # 取 top-k 最大的索引（注意：torch.topk 默认 descending=True）
-                topk_idxs = torch.topk(route[i, j], k, largest=True, sorted=True).indices
-                topk_indices[i, j, :k] = topk_idxs
-                for expert_idx in topk_idxs:
-                    mask[i, j, expert_idx] = False
+#         route = self.router(hidden_states)
+#         route = torch.nn.functional.softmax(route, dim=2)
+#         # topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
+#         batch_size, num_rows, num_candidates = route.shape  # (1, 8, 16)
+#         topk_indices = torch.full((batch_size, num_rows, num_candidates), -1, dtype=torch.long, device=route.device)
+#         mask = torch.full((batch_size, num_rows, num_candidates), True, dtype=torch.bool, device=route.device)
+#         for i in range(batch_size):
+#             for j in range(num_rows):
+#                 k = sampled_k[i, j].item()
+#                 if k == 0:
+#                     continue  # 全为 -1
+#                 # 取 top-k 最大的索引（注意：torch.topk 默认 descending=True）
+#                 topk_idxs = torch.topk(route[i, j], k, largest=True, sorted=True).indices
+#                 topk_indices[i, j, :k] = topk_idxs
+#                 for expert_idx in topk_idxs:
+#                     mask[i, j, expert_idx] = False
 
         
-        topk_ind = topk_indices
-        topk_weights = torch.where(mask, 0.0, route)
+#         topk_ind = topk_indices
+#         topk_weights = torch.where(mask, 0.0, route)
         
-        # print(chosen_k)
+#         # print(chosen_k)
 
-        hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
-        topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
-        topk_ind = topk_ind.view(-1, topk_ind.size(2))
+#         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
+#         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
+#         topk_ind = topk_ind.view(-1, topk_ind.size(2))
 
-        output_total = torch.zeros_like(hidden_states).to(hidden_states)
-        for expert_num, expert in enumerate(self.experts):
-            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-            hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-            expert_output = expert(hidden)
-            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
+#         output_total = torch.zeros_like(hidden_states).to(hidden_states)
+#         for expert_num, expert in enumerate(self.experts):
+#             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
+#             hidden = hidden_states[sample_ind.unsqueeze(1), :] 
+#             expert_output = expert(hidden)
+#             output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
 
-        output_total = output_total.view(s, b, h)
-        return output_total
+#         output_total = output_total.view(s, b, h)
+#         return output_total
             
     
     
-    def process_with_selected_experts(self, hidden_states, selected_experts):
+#     def process_with_selected_experts(self, hidden_states, selected_experts):
+#         """
+#         根据采样选择的专家处理hidden_states
+#         """
+#         batch_size, seq_len, hidden_size = hidden_states.shape
+        
+#         # 重塑为二维进行处理
+#         hidden_flat = hidden_states.view(-1, hidden_size)  # [batch*seq_len, hidden_size]
+#         selected_flat = selected_experts.view(-1)  # [batch*seq_len]
+        
+#         output = torch.zeros_like(hidden_flat)
+        
+#         # 为每个专家处理对应的tokens
+#         for expert_idx, expert in enumerate(self.experts):
+#             mask = (selected_flat == expert_idx)
+#             if mask.any():
+#                 expert_output = expert(hidden_flat[mask])
+#                 output[mask] = expert_output
+        
+#         return output.view(batch_size, seq_len, hidden_size)
+class EnhancedSwitchMLP(nn.Module):
+    """
+    Ada-K Routing MLP (MoE FFN)
+    - frozen router W_r
+    - trainable allocator W_alloc
+    - dynamic top-k routing controlled by allocator
+    - PPO trajectory storage for allocator
+    """
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_num = layer_idx
+        self.hidden_size  = config.hidden_size
+        self.num_experts  = config.num_experts
+        self.max_k        = 6     # 论文中的 K_max
+
+        # =============================
+        # Experts (全部冻结)
+        # =============================
+        self.experts = torch.nn.ModuleList()
+        for i in range(config.num_experts):
+            self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
+        for expert in self.experts:
+            for p in expert.parameters():
+                p.requires_grad = False
+
+        # =============================
+        # Router (W_r) —— MoE routing
+        # 冻结，用于给专家排序
+        # =============================
+        self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        for p in self.router.parameters():
+            p.requires_grad = False
+
+        # =============================
+        # Allocator (W_alloc) —— 论文新增
+        # 可训练，通过 PPO 更新
+        # =============================
+        self.allocator = AdaKAllocator(
+            hidden_size=self.hidden_size,
+            max_k=self.max_k
+        )
+
+        # =============================
+        # PPO Buffer（每层独有）
+        # =============================
+        self.ppo_buffer = []
+
+
+    # ==========================================================
+    # Forward：论文 Ada-K routing 的完整执行流程
+    # ==========================================================
+    def forward(self, hidden_states):
         """
-        根据采样选择的专家处理hidden_states
+        hidden_states: [B,S,H]
+        returns:
+            routed_output: [B,S,H]
+            （PPO 数据已写入 self.ppo_buffer）
         """
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        
-        # 重塑为二维进行处理
-        hidden_flat = hidden_states.view(-1, hidden_size)  # [batch*seq_len, hidden_size]
-        selected_flat = selected_experts.view(-1)  # [batch*seq_len]
-        
-        output = torch.zeros_like(hidden_flat)
-        
-        # 为每个专家处理对应的tokens
-        for expert_idx, expert in enumerate(self.experts):
-            mask = (selected_flat == expert_idx)
-            if mask.any():
-                expert_output = expert(hidden_flat[mask])
-                output[mask] = expert_output
-        
-        return output.view(batch_size, seq_len, hidden_size)
-    
+        B, S, H = hidden_states.shape
+
+        # ------------------------------------------------------
+        # 1. Router logits —— 冻结，只作为专家排序依据（论文 §3.3）
+        # ------------------------------------------------------
+        router_logits = self.router(hidden_states).float()  # [B,S,E]
+        router_logits = torch.clamp(router_logits, -30, 30)
+
+        # ------------------------------------------------------
+        # 2. Allocator：预测 k 的分布（论文 §3.2）
+        # ------------------------------------------------------
+        alloc_logits, alloc_probs = self.allocator(hidden_states)   # [B,S,K]
+
+        # 采样 k （论文使用 REINFORCE/PPO）
+        sampled_k = torch.multinomial(
+            alloc_probs.view(-1, self.max_k),
+            num_samples=1
+        ).view(B, S)  # [B,S], 取值范围 0~max_k-1
+
+        # ------------------------------------------------------
+        # 3. Router：对专家打分并排序
+        # ------------------------------------------------------
+        # 取得所有 expert 的排序结果（最大 K）
+        k_max = sampled_k.max().item() + 1   # 采样的 k 是 index，需要 +1 才是数量
+        topk_scores, topk_indices = torch.topk(
+            router_logits,
+            k=k_max,
+            dim=-1
+        )   # [B,S,k_max]
+
+        # ------------------------------------------------------
+        # 4. 按每个 token 的 k 做 mask
+        # ------------------------------------------------------
+        mask_j = torch.arange(k_max, device=hidden_states.device).view(1,1,k_max)
+        mask = mask_j < (sampled_k.unsqueeze(-1) + 1)  # +1: index→数量
+
+        topk_indices = topk_indices * mask + (~mask) * 0  # dummy expert idx
+
+        # ------------------------------------------------------
+        # 5. Expert Forward（论文 §3.1）
+        # ------------------------------------------------------
+        hidden_flat = hidden_states.reshape(-1, H)
+        expert_idx_flat = topk_indices.reshape(-1, k_max)
+
+        out_flat = torch.zeros_like(hidden_flat)
+
+        for e in range(self.num_experts):
+            mask_e = (expert_idx_flat == e).any(dim=-1)
+            if mask_e.sum() == 0:
+                continue
+            out_flat[mask_e] += self.experts[e](hidden_flat[mask_e])
+
+        outputs = out_flat.reshape(B, S, H)
+
+        # ------------------------------------------------------
+        # 6. 保存 PPO 信息 —— 分层存储
+        # ------------------------------------------------------
+        self.ppo_buffer.append({
+            "alloc_logits": alloc_logits.detach(),  # [B,S,K]
+            "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
+            "sampled_k":    sampled_k.detach(),     # [B,S]
+        })
+
+        return outputs
