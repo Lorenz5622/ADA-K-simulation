@@ -37,6 +37,7 @@ from .configuration_moe import MoEConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
+MAX_K = 6
 test_flag = False # 为true给训练使用
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -187,66 +188,6 @@ def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
     sorted_indices = torch.where(mask, -1, sorted_indices)
     sorted_probs = torch.where(mask, 0.0, sorted_probs)   
     return sorted_probs, sorted_indices
-
-class SwitchMLP(nn.Module):
-    """
-    Routes input to one of N MLP "experts"
-    """
-    def __init__(self, config, layer_idx):
-        super(SwitchMLP, self).__init__()
-        self.layer_num = layer_idx
-        self.use_switch = (layer_idx % config.expert_frequency) == 0 # Ensure the first layer use switch mlp
-        if self.use_switch:
-            self.top_p_threshold = config.top_p_threshold
-            self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
-            self.experts = torch.nn.ModuleList()
-            self.num_experts = config.num_experts
-            for i in range(config.num_experts):
-                self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
-        else:
-            self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
-        
-    def forward(self, hidden_states, chosen_k):
-        # fixed_k = [6,6,5,5,4,4,4,4,4,3,3,3,2,3,2,2,3,2,2,2,2,2,1,1,1,2,1,1,1,1,1,1]
-
-        # cur_k = 3
-        # print(cur_k)
-        if not self.use_switch:
-            output = self.mlp(hidden_states)
-            return output
-
-        s = hidden_states.size(0)
-        b = hidden_states.size(1)
-        h = hidden_states.size(2)
-        # print(f"chosen k: {chosen_k}")
-        if int(chosen_k) == 0:
-            return hidden_states
-        print(f"hidden_states.shape: {hidden_states.shape}")
-        
-        route = self.router(hidden_states)
-        print(f"route.shape: {route.shape}")
-        route = torch.nn.functional.softmax(route, dim=2)
-        
-
-        # topk_weights, topk_ind = top_p_sampling_batched_all_sequence(route, self.top_p_threshold)
-        # print(chosen_k)
-        topk_weights, topk_ind = torch.topk(route, int(chosen_k))
-        # print(chosen_k)
-
-        hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
-        topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
-        topk_ind = topk_ind.view(-1, topk_ind.size(2))
-
-        output_total = torch.zeros_like(hidden_states).to(hidden_states)
-        for expert_num, expert in enumerate(self.experts):
-            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-            hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-            expert_output = expert(hidden)
-            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
-
-
-        output_total = output_total.view(s, b, h)
-        return output_total
                 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -341,19 +282,10 @@ class LlamaDecoderLayer(nn.Module):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
-        # self.mlp = LlamaMLP(
-        #     hidden_size=self.hidden_size,
-        #     intermediate_size=config.intermediate_size,
-        #     hidden_act=config.hidden_act,
-        # )
-        # self.mlp = EnhancedSwitchMLP(config, layer_idx)
         self.mlp = EnhancedSwitchMLP(
             config=config,
             layer_idx=layer_idx,
         )
-        # self.mlp = SwitchMLP(config, layer_idx)
-        # self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.input_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -676,7 +608,6 @@ class MoEModel(MoEPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    # chosen_k=dynamic_k[idx],
                 )
 
             hidden_states = layer_outputs[0]
@@ -725,6 +656,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         self.saved_logits = []
         self.collected_hidden_states = []
         self.ppo_buffer = []
+        self.num_layers = config.num_hidden_layers
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -751,97 +683,99 @@ class MoEForCausalLM(MoEPreTrainedModel):
             if hasattr(layer.mlp, "allocator"):
                 params += list(layer.mlp.allocator.parameters())
         return params
+    
+    def clear_ppo_buffer(self):
+        self.ppo_buffer = []
+    
     def ppo_update(self, ppo_batches):
         """
-        ppo_batches: 由外部整理好的 PPO 数据
-        每个元素形如:
-        {
-            "state": Tensor,
-            "action": Tensor,
-            "log_prob": Tensor,
-            "pi_prob": Tensor,
-            "reward": Tensor,
-            "advantage": Tensor,
-        }
+        ppo_batches: 来自 Trainer 整理的 PPO 数据
+        每个 batch item 格式:
+            {
+                "layer_id": int,
+                "state": Tensor[B,S,H],
+                "action": Tensor[B,S],
+                "old_log_prob": Tensor[B,S],
+                "advantage": Tensor[B,1],
+            }
+        只更新 allocator (W_alloc)
         """
-
-        # === 1) 找到所有 ExpertSelector.router 参数 ===
-        router_params = []
-        for layer in self.model.layers:
-            if hasattr(layer.mlp, "expert_selector"):
-                router_params += list(layer.mlp.expert_selector.router.parameters())
-
-        if len(router_params) == 0:
-            print("⚠ Warning: No ExpertSelector.router found.")
-            return
-
-        optimizer = torch.optim.Adam(router_params, lr=1e-4)
-
         clip_range = 0.2
-
-        # === 2) 累加所有 loss 再反向传播（保证梯度稳定）===
         total_loss = 0.0
 
+        # 1) 找到所有 allocator 参数
+        alloc_params = []
+        for layer in self.model.layers:
+            if hasattr(layer.mlp, "allocator"):
+                alloc_params += list(layer.mlp.allocator.parameters())
+
+        if len(alloc_params) == 0:
+            print("⚠ Warning: No allocator found.")
+            return
+
+        optimizer = torch.optim.Adam(alloc_params, lr=1e-4)
+
+        # 2) 逐 batch 计算 PPO 损失
         for batch in ppo_batches:
+            layer_id = batch["layer_id"]
             state = batch["state"]             # [B,S,H]
             action = batch["action"]           # [B,S]
-            old_log_prob = batch["log_prob"]   # log π_old(a|s)
-            advantage = batch["advantage"]     # A(s,a)
+            old_log_prob = batch["old_log_prob"]  # [B,S]
+            advantage = batch["advantage"]     # [B,1]
+            old_alloc_logits = batch["old_alloc_logits"]
+            # 对应层的 allocator
+            layer = self.model.layers[layer_id]
+            allocator = layer.mlp.allocator
 
-            # --- PPO 允许 reward/advantage 为常数张量 ---
-            # reward/advantage 已由外部计算完成
-            # old_log_prob 已经 detach，不参与梯度
+            # 3) 通过 allocator 重新计算 log_prob_new
+            logits, probs = allocator(state)   # [B,S,K]
+            log_probs = torch.log(probs + 1e-8)
+            
+            new_log_prob = torch.gather(
+                log_probs,
+                dim=-1,
+                index=action.unsqueeze(-1)
+            ).squeeze(-1)  # [B,S]
 
-            # === 3) 计算 π_new(a|s): 再次前向 ExpertSelector.router ===
-            # 我们必须手动找到对应层的 router
-            # 这里假设所有层共享 PPO 数据，因此直接逐层 forward
-            new_logits_list = []
-            new_log_prob_list = []
-
-            for layer in self.model.layers:
-                if hasattr(layer.mlp, "expert_selector"):
-                    # 从当前层的 router 得到 logits
-                    logits = layer.mlp.expert_selector.router(state).float()
-                    logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits
-                    probs  = torch.softmax(logits, dim=-1)
-                    probs  = torch.clamp(probs, 1e-8, 1.0)  # ★ 防止 0 概率
-
-                    log_probs = torch.log(probs)
-
-                    # 取当前动作的 log π_new(a|s)
-                    new_log_prob = torch.gather(
-                        log_probs, 
-                        dim=-1,
-                        index=action.unsqueeze(-1)
-                    ).squeeze(-1)   # [B,S]
-
-                    new_log_prob_list.append(new_log_prob)
-
-            # === 4) 把多层 PPO 数据取平均（或相加）===
-            # 一般 MoE 的 router 每层独立，最简单的做法是所有层 loss 相加
-            new_log_prob = torch.stack(new_log_prob_list).mean(dim=0)
-
-            # === 5) 计算 PPO ratio ===
+            # 4) 计算 PPO ratio
             ratio = torch.exp(new_log_prob - old_log_prob)
 
-            # === 6) PPO Clipped loss（论文公式 7）===
-            unclipped = -ratio * advantage
+            # 5) PPO clipped 对象函数
+            # unclipped = ratio * advantage      # [B,S]
+            # clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            # clipped = clipped_ratio * advantage
+
+            # loss = -torch.mean(torch.min(unclipped, clipped))
+            unclipped = ratio * advantage      # [B,S]
             clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            clipped = -clipped_ratio * advantage
+            clipped = clipped_ratio * advantage
+            ppo_loss = -torch.mean(torch.min(unclipped, clipped))
 
-            loss = torch.mean(torch.max(unclipped, clipped))
+            # =====================================================
+            # ★ 插入位置：在这里加入 Entropy Bonus + KL Penalty
+            # =====================================================
 
+            # --- Entropy bonus -----------------------------------
+            # probs:  [B,S,K]
+            # log_probs: [B,S,K]
+            entropy = -(probs * log_probs).sum(dim=-1).mean()    # scalar
+            with torch.no_grad():
+                old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
+            # --- KL penalty (new vs old) -------------------------
+            # 需要 old_log_probs 展开成 shape [B,S,K]
+            kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
+
+            # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
+            loss = ppo_loss - 0.01 * entropy + 0.1 * kl
             total_loss += loss
 
-        # === 7) 反向传播 ===
+        # 6) 反向传播
         optimizer.zero_grad()
         total_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(router_params, max_norm=1.0)
-        
+        torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
         optimizer.step()
 
-        print(f"[PPO Router] Update complete. Loss = {total_loss.item():.4f}")
+        print(f"[PPO Allocator] Update complete. Loss = {total_loss.item():.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -907,25 +841,6 @@ class MoEForCausalLM(MoEPreTrainedModel):
         )
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
-        # if(test_flag):
-        #     collected_hidden_states = outputs.hidden_states_all
-        #     for idx in range(len(collected_hidden_states)):
-        #         if logits.dim() == 3:
-        #             if logits.size(1) > 1:  # 第一次生成
-        #                 self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx][:, -1:, :]))
-        #             else:
-        #                 self.collected_hidden_states.append(self.lm_head(collected_hidden_states[idx]))
-                
-                # print(f"self.collected_hidden_states{idx}.shape: {self.collected_hidden_states[idx].shape}")
-        # print(f"logits.shape: {logits.shape}")
-        # if logits.dim() == 3:
-        #     if logits.size(1) > 1:  # 第一次生成
-        #         self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token
-        #     else:
-        #         self.saved_logits.append(logits)  # 后续每个都直接保存
-        # self.saved_logits.append(logits)  # 后续每个都直接保存
-        # print(f"new logits: {logits.shape}")
-        # print(f"self.saved_logits: {len(self.saved_logits)}")
 
         loss = None
         if labels is not None:
@@ -946,9 +861,9 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
         ppo_all_layers = []
         for layer in self.model.layers:
-            if hasattr(layer.mlp, "ppo_trajectory"):
-                ppo_all_layers.extend(layer.mlp.ppo_trajectory)
-                layer.mlp.ppo_trajectory = []  # 清空，避免累积
+            if hasattr(layer.mlp, "ppo_buffer"):
+                ppo_all_layers.extend(layer.mlp.ppo_buffer)
+                layer.mlp.ppo_buffer = []  # 清空，避免累积
         self.ppo_buffer.extend(ppo_all_layers)
         return CausalLMOutputWithPast(
             loss=loss,
@@ -1138,30 +1053,6 @@ class ExpertSelector(nn.Module):
         # 使用较小的标准差初始化，避免极端概率
         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
     
-    # def forward(self, hidden_states):
-    #     """
-    #     根据hidden_states计算专家选择概率并采样
-        
-    #     Args:
-    #         hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
-            
-    #     Returns:
-    #         probs: 专家选择概率分布 [batch_size, seq_len, num_experts]
-    #         selected_experts: 采样得到的专家索引 [batch_size, seq_len]
-    #     """
-    #     # 计算每个专家的得分
-    #     router_logits = self.router(hidden_states)  # [batch_size, seq_len, num_experts]
-        
-    #     # 通过softmax获得概率分布
-    #     probs = torch.nn.functional.softmax(router_logits, dim=-1)
-        
-    #     # 从概率分布中采样获得专家索引
-    #     # 方法1: 多项式采样
-    #     selected_experts_num = torch.multinomial(probs.view(-1, self.num_experts), 1).view(
-    #         hidden_states.shape[:-1]
-    #     )
-        
-    #     return probs, selected_experts_num
     def forward(self, hidden_states):
         """
         返回用于 MoE 路由的:
@@ -1244,113 +1135,6 @@ class AdaKAllocator(nn.Module):
         probs = torch.clamp(probs, 1e-8, 1.0)
         return logits, probs
 
-# 使用示例
-# class EnhancedSwitchMLP(nn.Module):
-#     """
-#     增强版SwitchMLP，使用ExpertSelector进行专家选择
-#     """
-#     def __init__(self, config, layer_idx):
-#         super(EnhancedSwitchMLP, self).__init__()
-#         self.layer_num = layer_idx
-#         self.use_switch = (layer_idx % config.expert_frequency) == 0
-#         self.ppo_trajectory = []
-#         if self.use_switch:
-#             # 使用新的专家选择器
-#             self.expert_selector = ExpertSelector(config)
-#             self.experts = torch.nn.ModuleList()
-#             self.router = torch.nn.Linear(config.hidden_size, config.num_experts, bias=False)
-#             self.num_experts = config.num_experts
-#             for i in range(config.num_experts):
-#                 self.experts.append(LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act))
-#         else:
-#             self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size, config.hidden_act)
-    
-#     def forward(self, hidden_states, use_sampling=True):
-#         if not self.use_switch:
-#             return self.mlp(hidden_states)
-        
-
-#         # 原样复制switchMLP
-#         if not self.use_switch:
-#             output = self.mlp(hidden_states)
-#             return output
-
-#         s = hidden_states.size(0)
-#         b = hidden_states.size(1)
-#         h = hidden_states.size(2)
-#         # print(f"hidden_states.shape: {hidden_states.shape}")
-
-#         # 使用采样得到的top-k值进行专家选择
-#         probs, sampled_k, ppo_info  = self.expert_selector(hidden_states)
-#         ppo_step = {
-#             "layer_id": id(self),           # 或者给每层分配 index
-#             "state": ppo_info["state"],
-#             "action": ppo_info["action"],
-#             "log_prob": ppo_info["log_prob"],
-#             "pi_prob": ppo_info["pi_prob"],
-#         }
-#         self.ppo_trajectory.append(ppo_step)
-
-#         route = self.router(hidden_states)
-#         route = torch.nn.functional.softmax(route, dim=2)
-#         # topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
-#         batch_size, num_rows, num_candidates = route.shape  # (1, 8, 16)
-#         topk_indices = torch.full((batch_size, num_rows, num_candidates), -1, dtype=torch.long, device=route.device)
-#         mask = torch.full((batch_size, num_rows, num_candidates), True, dtype=torch.bool, device=route.device)
-#         for i in range(batch_size):
-#             for j in range(num_rows):
-#                 k = sampled_k[i, j].item()
-#                 if k == 0:
-#                     continue  # 全为 -1
-#                 # 取 top-k 最大的索引（注意：torch.topk 默认 descending=True）
-#                 topk_idxs = torch.topk(route[i, j], k, largest=True, sorted=True).indices
-#                 topk_indices[i, j, :k] = topk_idxs
-#                 for expert_idx in topk_idxs:
-#                     mask[i, j, expert_idx] = False
-
-        
-#         topk_ind = topk_indices
-#         topk_weights = torch.where(mask, 0.0, route)
-        
-#         # print(chosen_k)
-
-#         hidden_states = hidden_states.view(-1, hidden_states.size(2)) 
-#         topk_weights = topk_weights.view(-1, topk_weights.size(2)) 
-#         topk_ind = topk_ind.view(-1, topk_ind.size(2))
-
-#         output_total = torch.zeros_like(hidden_states).to(hidden_states)
-#         for expert_num, expert in enumerate(self.experts):
-#             sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
-#             hidden = hidden_states[sample_ind.unsqueeze(1), :] 
-#             expert_output = expert(hidden)
-#             output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
-
-
-#         output_total = output_total.view(s, b, h)
-#         return output_total
-            
-    
-    
-#     def process_with_selected_experts(self, hidden_states, selected_experts):
-#         """
-#         根据采样选择的专家处理hidden_states
-#         """
-#         batch_size, seq_len, hidden_size = hidden_states.shape
-        
-#         # 重塑为二维进行处理
-#         hidden_flat = hidden_states.view(-1, hidden_size)  # [batch*seq_len, hidden_size]
-#         selected_flat = selected_experts.view(-1)  # [batch*seq_len]
-        
-#         output = torch.zeros_like(hidden_flat)
-        
-#         # 为每个专家处理对应的tokens
-#         for expert_idx, expert in enumerate(self.experts):
-#             mask = (selected_flat == expert_idx)
-#             if mask.any():
-#                 expert_output = expert(hidden_flat[mask])
-#                 output[mask] = expert_output
-        
-#         return output.view(batch_size, seq_len, hidden_size)
 class EnhancedSwitchMLP(nn.Module):
     """
     Ada-K Routing MLP (MoE FFN)
@@ -1364,8 +1148,8 @@ class EnhancedSwitchMLP(nn.Module):
         self.layer_num = layer_idx
         self.hidden_size  = config.hidden_size
         self.num_experts  = config.num_experts
-        self.max_k        = 6     # 论文中的 K_max
-
+        self.max_k        = MAX_K     # 论文中的 K_max
+        self.k_counter = []
         # =============================
         # Experts (全部冻结)
         # =============================
@@ -1409,6 +1193,7 @@ class EnhancedSwitchMLP(nn.Module):
             routed_output: [B,S,H]
             （PPO 数据已写入 self.ppo_buffer）
         """
+        
         B, S, H = hidden_states.shape
 
         # ------------------------------------------------------
@@ -1421,13 +1206,26 @@ class EnhancedSwitchMLP(nn.Module):
         # 2. Allocator：预测 k 的分布（论文 §3.2）
         # ------------------------------------------------------
         alloc_logits, alloc_probs = self.allocator(hidden_states)   # [B,S,K]
-
+        # print("MLP training:", self.training)
         # 采样 k （论文使用 REINFORCE/PPO）
         sampled_k = torch.multinomial(
             alloc_probs.view(-1, self.max_k),
             num_samples=1
         ).view(B, S)  # [B,S], 取值范围 0~max_k-1
+        # if self.training:
+        #     if not hasattr(self, "k_counter"):
+        #         self.k_counter = []
+        #     # sampled_k shape: [B, S]
+        #     self.k_counter.append(sampled_k.detach().flatten().cpu())
+            # print(self.k_counter)
+        if self.training:
+            # 在线统计直方图，不保存所有 token 的 k
+            if not hasattr(self, "k_hist"):
+                self.k_hist = torch.zeros(self.max_k, device=hidden_states.device)
 
+            # sampled_k ∈ [0..K-1]
+            bcount = torch.bincount(sampled_k.reshape(-1), minlength=self.max_k)
+            self.k_hist += bcount
         # ------------------------------------------------------
         # 3. Router：对专家打分并排序
         # ------------------------------------------------------
@@ -1466,10 +1264,35 @@ class EnhancedSwitchMLP(nn.Module):
         # ------------------------------------------------------
         # 6. 保存 PPO 信息 —— 分层存储
         # ------------------------------------------------------
-        self.ppo_buffer.append({
-            "alloc_logits": alloc_logits.detach(),  # [B,S,K]
-            "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
-            "sampled_k":    sampled_k.detach(),     # [B,S]
-        })
+        # top_model = self.parent_model._moe_for_causal_lm
+        # top_model.ppo_buffer.append({
+        #     "layer_id": self.layer_num,  
+        #     "alloc_logits": alloc_logits.detach(),  # [B,S,K]
+        #     "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
+        #     "sampled_k":    sampled_k.detach(),     # [B,S]
+        # })
+        # self.ppo_buffer.append({
+        #     "layer_id": self.layer_num,  
+        #     "alloc_logits": alloc_logits.detach(),  # [B,S,K]
+        #     "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
+        #     "sampled_k":    sampled_k.detach(),     # [B,S]
+        # })
+        logits = alloc_logits            # [B,S,K]
+        probs  = alloc_probs             # [B,S,K]
+        log_probs = torch.log(probs + 1e-8)
 
+        old_log_prob = torch.gather(
+            log_probs,
+            dim=-1,
+            index=sampled_k.unsqueeze(-1)
+        ).squeeze(-1)  # [B,S]
+
+        # 保存完整 PPO 轨迹
+        self.ppo_buffer.append({
+            "layer_id": self.layer_num,
+            "state": hidden_states.detach(),   # [B,S,H]
+            "action": sampled_k.detach(),      # [B,S]
+            "old_log_prob": old_log_prob.detach(),  # [B,S]
+            "old_alloc_logits": alloc_logits.detach(),
+        })
         return outputs
