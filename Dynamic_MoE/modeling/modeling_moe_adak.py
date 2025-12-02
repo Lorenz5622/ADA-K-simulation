@@ -720,6 +720,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.saved_logits = []
         self.collected_hidden_states = []
+        self.ppo_buffer = []
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -740,6 +741,98 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
     def get_decoder(self):
         return self.model
+    
+    def ppo_update(self, ppo_batches):
+        """
+        ppo_batches: 由外部整理好的 PPO 数据
+        每个元素形如:
+        {
+            "state": Tensor,
+            "action": Tensor,
+            "log_prob": Tensor,
+            "pi_prob": Tensor,
+            "reward": Tensor,
+            "advantage": Tensor,
+        }
+        """
+
+        # === 1) 找到所有 ExpertSelector.router 参数 ===
+        router_params = []
+        for layer in self.model.layers:
+            if hasattr(layer.mlp, "expert_selector"):
+                router_params += list(layer.mlp.expert_selector.router.parameters())
+
+        if len(router_params) == 0:
+            print("⚠ Warning: No ExpertSelector.router found.")
+            return
+
+        optimizer = torch.optim.Adam(router_params, lr=1e-4)
+
+        clip_range = 0.2
+
+        # === 2) 累加所有 loss 再反向传播（保证梯度稳定）===
+        total_loss = 0.0
+
+        for batch in ppo_batches:
+            state = batch["state"]             # [B,S,H]
+            action = batch["action"]           # [B,S]
+            old_log_prob = batch["log_prob"]   # log π_old(a|s)
+            advantage = batch["advantage"]     # A(s,a)
+
+            # --- PPO 允许 reward/advantage 为常数张量 ---
+            # reward/advantage 已由外部计算完成
+            # old_log_prob 已经 detach，不参与梯度
+
+            # === 3) 计算 π_new(a|s): 再次前向 ExpertSelector.router ===
+            # 我们必须手动找到对应层的 router
+            # 这里假设所有层共享 PPO 数据，因此直接逐层 forward
+            new_logits_list = []
+            new_log_prob_list = []
+
+            for layer in self.model.layers:
+                if hasattr(layer.mlp, "expert_selector"):
+                    # 从当前层的 router 得到 logits
+                    logits = layer.mlp.expert_selector.router(state).float()
+                    logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits
+                    probs  = torch.softmax(logits, dim=-1)
+                    probs  = torch.clamp(probs, 1e-8, 1.0)  # ★ 防止 0 概率
+
+                    log_probs = torch.log(probs)
+
+                    # 取当前动作的 log π_new(a|s)
+                    new_log_prob = torch.gather(
+                        log_probs, 
+                        dim=-1,
+                        index=action.unsqueeze(-1)
+                    ).squeeze(-1)   # [B,S]
+
+                    new_log_prob_list.append(new_log_prob)
+
+            # === 4) 把多层 PPO 数据取平均（或相加）===
+            # 一般 MoE 的 router 每层独立，最简单的做法是所有层 loss 相加
+            new_log_prob = torch.stack(new_log_prob_list).mean(dim=0)
+
+            # === 5) 计算 PPO ratio ===
+            ratio = torch.exp(new_log_prob - old_log_prob)
+
+            # === 6) PPO Clipped loss（论文公式 7）===
+            unclipped = -ratio * advantage
+            clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            clipped = -clipped_ratio * advantage
+
+            loss = torch.mean(torch.max(unclipped, clipped))
+
+            total_loss += loss
+
+        # === 7) 反向传播 ===
+        optimizer.zero_grad()
+        total_loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(router_params, max_norm=1.0)
+        
+        optimizer.step()
+
+        print(f"[PPO Router] Update complete. Loss = {total_loss.item():.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -821,7 +914,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         #         self.saved_logits.append(logits[:, -1:, :])  # 取最后一个 token
         #     else:
         #         self.saved_logits.append(logits)  # 后续每个都直接保存
-        self.saved_logits.append(logits)  # 后续每个都直接保存
+        # self.saved_logits.append(logits)  # 后续每个都直接保存
         # print(f"new logits: {logits.shape}")
         # print(f"self.saved_logits: {len(self.saved_logits)}")
 
@@ -842,6 +935,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
+        ppo_all_layers = []
+        for layer in self.model.layers:
+            if hasattr(layer.mlp, "ppo_trajectory"):
+                ppo_all_layers.extend(layer.mlp.ppo_trajectory)
+                layer.mlp.ppo_trajectory = []  # 清空，避免累积
+        self.ppo_buffer.extend(ppo_all_layers)
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1030,30 +1129,71 @@ class ExpertSelector(nn.Module):
         # 使用较小的标准差初始化，避免极端概率
         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
     
+    # def forward(self, hidden_states):
+    #     """
+    #     根据hidden_states计算专家选择概率并采样
+        
+    #     Args:
+    #         hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
+            
+    #     Returns:
+    #         probs: 专家选择概率分布 [batch_size, seq_len, num_experts]
+    #         selected_experts: 采样得到的专家索引 [batch_size, seq_len]
+    #     """
+    #     # 计算每个专家的得分
+    #     router_logits = self.router(hidden_states)  # [batch_size, seq_len, num_experts]
+        
+    #     # 通过softmax获得概率分布
+    #     probs = torch.nn.functional.softmax(router_logits, dim=-1)
+        
+    #     # 从概率分布中采样获得专家索引
+    #     # 方法1: 多项式采样
+    #     selected_experts_num = torch.multinomial(probs.view(-1, self.num_experts), 1).view(
+    #         hidden_states.shape[:-1]
+    #     )
+        
+    #     return probs, selected_experts_num
     def forward(self, hidden_states):
         """
-        根据hidden_states计算专家选择概率并采样
-        
-        Args:
-            hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
-            
-        Returns:
-            probs: 专家选择概率分布 [batch_size, seq_len, num_experts]
-            selected_experts: 采样得到的专家索引 [batch_size, seq_len]
+        返回用于 MoE 路由的:
+            probs: [B,S,E]
+            sampled_k: [B,S]
+
+        返回给 PPO 的:
+            ppo_info = {
+                "state": hidden_states.detach(),
+                "action": sampled_k.detach(),
+                "log_prob": log_prob_k.detach(),
+                "pi_prob": probs.detach(),
+            }
         """
-        # 计算每个专家的得分
-        router_logits = self.router(hidden_states)  # [batch_size, seq_len, num_experts]
-        
-        # 通过softmax获得概率分布
-        probs = torch.nn.functional.softmax(router_logits, dim=-1)
-        
-        # 从概率分布中采样获得专家索引
-        # 方法1: 多项式采样
-        selected_experts_num = torch.multinomial(probs.view(-1, self.num_experts), 1).view(
-            hidden_states.shape[:-1]
-        )
-        
-        return probs, selected_experts_num
+        logits = self.router(hidden_states).float()
+        logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits 范围，绝不溢出
+        probs  = torch.softmax(logits, dim=-1)
+
+        # 非可微采样动作（保持不变）
+        sampled_k = torch.multinomial(
+            probs.view(-1, self.num_experts),
+            1
+        ).view(hidden_states.shape[:-1])             # [B,S]
+
+        # 计算 log_prob(action)
+        log_probs = torch.log(probs + 1e-8)
+        log_prob_k = torch.gather(
+            log_probs,
+            dim=-1,
+            index=sampled_k.unsqueeze(-1)
+        ).squeeze(-1)                                # [B,S]
+
+        # 生成 PPO 信息
+        ppo_info = {
+            "state": hidden_states.detach(),     # 状态 s
+            "action": sampled_k.detach(),        # 动作 a
+            "log_prob": log_prob_k.detach(),     # log π_old(a|s)
+            "pi_prob": probs.detach(),           # π_old 概率分布（用于重要性采样）
+        }
+
+        return probs, sampled_k, ppo_info
     
     def compute_routing_entropy(self, hidden_states):
         """
@@ -1080,7 +1220,7 @@ class EnhancedSwitchMLP(nn.Module):
         super(EnhancedSwitchMLP, self).__init__()
         self.layer_num = layer_idx
         self.use_switch = (layer_idx % config.expert_frequency) == 0
-        
+        self.ppo_trajectory = []
         if self.use_switch:
             # 使用新的专家选择器
             self.expert_selector = ExpertSelector(config)
@@ -1105,10 +1245,19 @@ class EnhancedSwitchMLP(nn.Module):
         s = hidden_states.size(0)
         b = hidden_states.size(1)
         h = hidden_states.size(2)
-        print(f"hidden_states.shape: {hidden_states.shape}")
+        # print(f"hidden_states.shape: {hidden_states.shape}")
 
         # 使用采样得到的top-k值进行专家选择
-        probs, sampled_k  = self.expert_selector(hidden_states)
+        probs, sampled_k, ppo_info  = self.expert_selector(hidden_states)
+        ppo_step = {
+            "layer_id": id(self),           # 或者给每层分配 index
+            "state": ppo_info["state"],
+            "action": ppo_info["action"],
+            "log_prob": ppo_info["log_prob"],
+            "pi_prob": ppo_info["pi_prob"],
+        }
+        self.ppo_trajectory.append(ppo_step)
+
         route = self.router(hidden_states)
         route = torch.nn.functional.softmax(route, dim=2)
         # topk_weights, topk_indices = torch.topk(route, sampled_k, dim=-1)
