@@ -657,6 +657,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         self.collected_hidden_states = []
         self.ppo_buffer = []
         self.num_layers = config.num_hidden_layers
+        self.alloc_optimizer = torch.optim.Adam(self.get_allocator_params(), lr=1e-4)
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -713,7 +714,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
             print("⚠ Warning: No allocator found.")
             return
 
-        optimizer = torch.optim.Adam(alloc_params, lr=1e-4)
+        # optimizer = torch.optim.Adam(alloc_params, lr=1e-4)
 
         # 2) 逐 batch 计算 PPO 损失
         for batch in ppo_batches:
@@ -766,15 +767,22 @@ class MoEForCausalLM(MoEPreTrainedModel):
             kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
 
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
-            loss = ppo_loss - 0.01 * entropy + 0.1 * kl
+            loss = ppo_loss - 0.05 * entropy + 0.1 * kl
+            if layer_id == 23:
+                print(f"[PPO] layer={layer_id} | "
+                f"ppo_loss={ppo_loss.item():.4f} | "
+                f"entropy={entropy.item():.4f} | "
+                f"kl={kl.item():.4f} | "
+                f"loss={loss.item():.4f}")
             total_loss += loss
 
         # 6) 反向传播
-        optimizer.zero_grad()
+        print("Before:", allocator.alloc.weight[0][:10])
+        self.alloc_optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
-        optimizer.step()
-
+        self.alloc_optimizer.step()
+        print("After:", allocator.alloc.weight[0][:10])
         print(f"[PPO Allocator] Update complete. Loss = {total_loss.item():.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
@@ -1200,8 +1208,8 @@ class EnhancedSwitchMLP(nn.Module):
         # 1. Router logits —— 冻结，只作为专家排序依据（论文 §3.3）
         # ------------------------------------------------------
         router_logits = self.router(hidden_states).float()  # [B,S,E]
-        router_logits = torch.clamp(router_logits, -30, 30)
-
+        # router_logits = torch.clamp(router_logits, -30, 30)
+        router_logits = torch.nn.functional.softmax(router_logits, dim=2)
         # ------------------------------------------------------
         # 2. Allocator：预测 k 的分布（论文 §3.2）
         # ------------------------------------------------------
@@ -1212,12 +1220,6 @@ class EnhancedSwitchMLP(nn.Module):
             alloc_probs.view(-1, self.max_k),
             num_samples=1
         ).view(B, S)  # [B,S], 取值范围 0~max_k-1
-        # if self.training:
-        #     if not hasattr(self, "k_counter"):
-        #         self.k_counter = []
-        #     # sampled_k shape: [B, S]
-        #     self.k_counter.append(sampled_k.detach().flatten().cpu())
-            # print(self.k_counter)
         if self.training:
             # 在线统计直方图，不保存所有 token 的 k
             if not hasattr(self, "k_hist"):
@@ -1236,30 +1238,49 @@ class EnhancedSwitchMLP(nn.Module):
             k=k_max,
             dim=-1
         )   # [B,S,k_max]
+        # print(f"topk_indices: {topk_indices}")
+        # print(f"topk_scores: {topk_scores}")
+        # # ------------------------------------------------------
+        # # 4. 按每个 token 的 k 做 mask
+        # # ------------------------------------------------------
+        # mask_j = torch.arange(k_max, device=hidden_states.device).view(1,1,k_max)
+        # mask = mask_j < (sampled_k.unsqueeze(-1) + 1)  # +1: index→数量
+
+        # topk_indices = topk_indices * mask + (~mask) * 0  # dummy expert idx
+
+        # # ------------------------------------------------------
+        # # 5. Expert Forward（论文 §3.1）
+        # # ------------------------------------------------------
+        # hidden_flat = hidden_states.reshape(-1, H)
+        # expert_idx_flat = topk_indices.reshape(-1, k_max)
+
+        # out_flat = torch.zeros_like(hidden_flat)
+
+        # for e in range(self.num_experts):
+        #     mask_e = (expert_idx_flat == e).any(dim=-1)
+        #     if mask_e.sum() == 0:
+        #         continue
+        #     out_flat[mask_e] += self.experts[e](hidden_flat[mask_e])
+
+        # outputs = out_flat.reshape(B, S, H)
+
 
         # ------------------------------------------------------
-        # 4. 按每个 token 的 k 做 mask
+        # 4 new. 模仿原模型的output方式处理
         # ------------------------------------------------------
-        mask_j = torch.arange(k_max, device=hidden_states.device).view(1,1,k_max)
-        mask = mask_j < (sampled_k.unsqueeze(-1) + 1)  # +1: index→数量
+        hidden_flat = hidden_states.view(-1, hidden_states.size(2)) 
+        topk_weights = topk_scores.view(-1, topk_scores.size(2)) 
+        topk_ind = topk_indices.view(-1, topk_indices.size(2))
 
-        topk_indices = topk_indices * mask + (~mask) * 0  # dummy expert idx
+        output_total = torch.zeros_like(hidden_flat).to(hidden_flat)
+        for expert_num, expert in enumerate(self.experts):
+            sample_ind, expert_ind = torch.where(topk_ind == expert_num) 
+            hidden = hidden_flat[sample_ind.unsqueeze(1), :] 
+            expert_output = expert(hidden)
+            output_total[sample_ind] += torch.mul(expert_output.squeeze(1), topk_weights[sample_ind,expert_ind].unsqueeze(1))
 
-        # ------------------------------------------------------
-        # 5. Expert Forward（论文 §3.1）
-        # ------------------------------------------------------
-        hidden_flat = hidden_states.reshape(-1, H)
-        expert_idx_flat = topk_indices.reshape(-1, k_max)
 
-        out_flat = torch.zeros_like(hidden_flat)
-
-        for e in range(self.num_experts):
-            mask_e = (expert_idx_flat == e).any(dim=-1)
-            if mask_e.sum() == 0:
-                continue
-            out_flat[mask_e] += self.experts[e](hidden_flat[mask_e])
-
-        outputs = out_flat.reshape(B, S, H)
+        output_total = output_total.view(B, S, H)
 
         # ------------------------------------------------------
         # 6. 保存 PPO 信息 —— 分层存储
@@ -1295,4 +1316,4 @@ class EnhancedSwitchMLP(nn.Module):
             "old_log_prob": old_log_prob.detach(),  # [B,S]
             "old_alloc_logits": alloc_logits.detach(),
         })
-        return outputs
+        return output_total

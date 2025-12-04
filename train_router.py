@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 from datasets import load_dataset
-
+from datasets import concatenate_datasets
 from Dynamic_MoE.modeling.modeling_moe_adak import MoEForCausalLM
 
 # torchrun --nproc_per_node=1 train_router.py
@@ -94,6 +94,9 @@ class PPOTrainer(Trainer):
                 [reward, torch.zeros(B,1, device=reward.device)],  # pad 最后一个位置
                 dim=1
             )  # → [B,S]
+            print(f"[Reward] mean={reward.mean().item():.4f} "
+            f"max={reward.max().item():.4f} "
+            f"min={reward.min().item():.4f}")
 
             # # ---- PPO 稳定 clip ----
             # reward = torch.clamp(reward, -50, 50)
@@ -200,7 +203,11 @@ def load_piqa(tokenizer):
 # ============================================================
 # 4. 训练入口
 # ============================================================
-
+def repeat_dataset(ds, times=5):
+    return {
+        "train": torch.utils.data.ConcatDataset([ds["train"]] * times),
+        "validation": torch.utils.data.ConcatDataset([ds["validation"]] * times)
+    }
 def main():
 
     PATH_PREFIX = "/root"
@@ -215,13 +222,19 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
     # =============== 加载数据 ===============
+    # ds1 = load_dataset("piqa")["train"]
+    # ds2 = load_dataset("hellaswag")["train"]
+    # ds3 = load_dataset("commonsense_qa")["train"]
+    # all_train = concatenate_datasets([ds1, ds2, ds3])
+    # dataset = {"train": all_train}
     dataset = load_piqa(tokenizer)
+    dataset = repeat_dataset(dataset, times=1)
 
     # =============== Trainer 设置 ===============
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
         learning_rate=1e-3,
-        num_train_epochs=3,
+        num_train_epochs=6,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         save_strategy="epoch",

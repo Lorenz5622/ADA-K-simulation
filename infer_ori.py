@@ -31,7 +31,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
 if __name__ == "__main__":
     if os.path.exists("/home/cyx") :
         PATH_PREFIX = "/home/cyx"
-    model_path = f'{PATH_PREFIX}/models/Dynamic_MoE'
+    model_path = f'{PATH_PREFIX}/models/ADAK_MoE'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 
