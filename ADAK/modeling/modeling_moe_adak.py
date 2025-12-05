@@ -158,36 +158,36 @@ class LlamaMLP(nn.Module):
 
 
 
-def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
-    """
-    Apply Top-p sampling to every element in the sequence for each item in the batch.
-    Returns the selected token indices and the corresponding threshold indices.
+# def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
+#     """
+#     Apply Top-p sampling to every element in the sequence for each item in the batch.
+#     Returns the selected token indices and the corresponding threshold indices.
     
-    :param logits: Logits from a language model with shape (sequence length, batch size, L)
-    :param top_p: Cumulative probability threshold (float)
-    :param temperature: Sampling temperature (float)
-    :return: Tuple of tensors (selected token indices, threshold indices) for each position in each sequence in the batch
-    """
-    # Apply temperature
-    logits = logits / temperature
+#     :param logits: Logits from a language model with shape (sequence length, batch size, L)
+#     :param top_p: Cumulative probability threshold (float)
+#     :param temperature: Sampling temperature (float)
+#     :return: Tuple of tensors (selected token indices, threshold indices) for each position in each sequence in the batch
+#     """
+#     # Apply temperature
+#     logits = logits / temperature
     
-    # Convert logits to probabilities
-    # probabilities = torch.softmax(logits, dim=-1)
-    # Sort probabilities and their indices in descending order
-    sorted_probs, sorted_indices = torch.sort(logits, descending=True)
+#     # Convert logits to probabilities
+#     # probabilities = torch.softmax(logits, dim=-1)
+#     # Sort probabilities and their indices in descending order
+#     sorted_probs, sorted_indices = torch.sort(logits, descending=True)
 
-    # Compute cumulative probabilities
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    mask = cumulative_probs > top_p
+#     # Compute cumulative probabilities
+#     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+#     mask = cumulative_probs > top_p
 
-    # Find the threshold indices
-    threshold_indices = mask.long().argmax(dim=-1)
-    threshold_mask = torch.nn.functional.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
+#     # Find the threshold indices
+#     threshold_indices = mask.long().argmax(dim=-1)
+#     threshold_mask = torch.nn.functional.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
     
-    mask = mask & ~threshold_mask
-    sorted_indices = torch.where(mask, -1, sorted_indices)
-    sorted_probs = torch.where(mask, 0.0, sorted_probs)   
-    return sorted_probs, sorted_indices
+#     mask = mask & ~threshold_mask
+#     sorted_indices = torch.where(mask, -1, sorted_indices)
+#     sorted_probs = torch.where(mask, 0.0, sorted_probs)   
+#     return sorted_probs, sorted_indices
                 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -297,6 +297,7 @@ class LlamaDecoderLayer(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
+        output_router_logits: Optional[bool] = False,
         chosen_k: int  = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
@@ -333,7 +334,12 @@ class LlamaDecoderLayer(nn.Module):
         residual = hidden_states
         # hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.post_attention_norm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if output_router_logits:
+            out = self.mlp(hidden_states, output_router_logits)
+            # print(f"LlamaDecoderLayer hidden_states: {out['hidden_states']}")
+            # print(f"LlamaDecoderLayer router_logits: {out['router_logits']}")
+            return out
+        hidden_states = self.mlp(hidden_states, output_router_logits)
         hidden_states = residual + hidden_states
 
         outputs = (hidden_states,)
@@ -514,6 +520,7 @@ class MoEModel(MoEPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        output_router_logits=False,
         # dynamic_k: List[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -577,6 +584,27 @@ class MoEModel(MoEPreTrainedModel):
 
         collected_hidden_states = []
 
+        
+        if output_router_logits:
+            all_router_logits_for_warm = []
+            all_hidden_states_for_warm = []
+            for idx, decoder_layer in enumerate(self.layers):
+                out = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    output_router_logits=output_router_logits,
+                )
+                all_router_logits_for_warm.append(out['router_logits'])
+                all_hidden_states_for_warm.append(out['hidden_states'])
+                # print(f"MoEModel out.router_logits: {out['router_logits']}")
+                # print(f"MoEModel out.hidden_states: {out['hidden_states']}")
+            return {
+                "all_router_logits_for_warm": all_router_logits_for_warm,
+                "all_hidden_states_for_warm": all_hidden_states_for_warm,
+            }
         for idx, decoder_layer in enumerate(self.layers):
             # print(idx)
             if output_hidden_states:
@@ -599,6 +627,7 @@ class MoEModel(MoEPreTrainedModel):
                     attention_mask,
                     position_ids,
                     None,
+                    output_router_logits=output_router_logits,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -777,12 +806,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
             total_loss += loss
 
         # 6) 反向传播
-        print("Before:", allocator.alloc.weight[0][:10])
+        # print("Before:", allocator.alloc.weight[0][:10])
         self.alloc_optimizer.zero_grad()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
         self.alloc_optimizer.step()
-        print("After:", allocator.alloc.weight[0][:10])
+        # print("After:", allocator.alloc.weight[0][:10])
         print(f"[PPO Allocator] Update complete. Loss = {total_loss.item():.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
@@ -799,6 +828,7 @@ class MoEForCausalLM(MoEPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        output_router_logits=False,
         # dynamic_k: List[int] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
@@ -845,8 +875,11 @@ class MoEForCausalLM(MoEPreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            output_router_logits=output_router_logits,
             # dynamic_k=dynamic_k,
         )
+        if output_router_logits:
+            return outputs
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
 
@@ -934,6 +967,37 @@ class MoEForCausalLM(MoEPreTrainedModel):
     """,
     LLAMA_START_DOCSTRING,
 )
+def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
+    """
+    Apply Top-p sampling to every element in the sequence for each item in the batch.
+    Returns the selected token indices and the corresponding threshold indices.
+    
+    :param logits: Logits from a language model with shape (sequence length, batch size, L)
+    :param top_p: Cumulative probability threshold (float)
+    :param temperature: Sampling temperature (float)
+    :return: Tuple of tensors (selected token indices, threshold indices) for each position in each sequence in the batch
+    """
+    # Apply temperature
+    logits = logits / temperature
+    
+    # Convert logits to probabilities
+    # probabilities = torch.softmax(logits, dim=-1)
+    # Sort probabilities and their indices in descending order
+    sorted_probs, sorted_indices = torch.sort(logits, descending=True)
+
+    # Compute cumulative probabilities
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    mask = cumulative_probs > top_p
+
+    # Find the threshold indices
+    threshold_indices = mask.long().argmax(dim=-1)
+    threshold_mask = torch.nn.functional.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
+    
+    mask = mask & ~threshold_mask
+    sorted_indices = torch.where(mask, -1, sorted_indices)
+    sorted_probs = torch.where(mask, 0.0, sorted_probs)   
+    return sorted_probs, sorted_indices
+
 class LlamaForSequenceClassification(MoEPreTrainedModel):
     _keys_to_ignore_on_load_missing = [r"lm_head.weight"]
 
@@ -1125,10 +1189,17 @@ class AdaKAllocator(nn.Module):
     Per-layer allocator W_alloc in the paper.
     Computes P(k | h) for dynamic top-k expert routing.
     """
-    def __init__(self, hidden_size, max_k):
+    def __init__(self, hidden_size, max_k, hidden_dim = None):
         super().__init__()
         self.max_k = max_k
-        self.alloc = nn.Linear(hidden_size, max_k)
+        if hidden_dim is None:
+            hidden_dim = hidden_size  # 默认隐藏层=H
+        self.alloc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_dim),
+            nn.GELU(),                    # 激活函数
+            nn.Linear(hidden_dim, max_k)  # 输出 logits
+        )
+        
 
     def forward(self, hidden_states):
         """
@@ -1182,7 +1253,8 @@ class EnhancedSwitchMLP(nn.Module):
         # =============================
         self.allocator = AdaKAllocator(
             hidden_size=self.hidden_size,
-            max_k=self.max_k
+            max_k=self.max_k,
+            hidden_dim=50,
         )
 
         # =============================
@@ -1190,11 +1262,36 @@ class EnhancedSwitchMLP(nn.Module):
         # =============================
         self.ppo_buffer = []
 
+    def compute_pseudo_k_top_p(self, router_logits, top_p=0.9, temperature=1.0):
+        """
+        router_logits: [B,S,E]   每层 Router 输出
+        输出 pseudo_k: [B,S]     每个 token 的 expert count（k 值）
+        """
 
+        # 你的函数要求: logits shape = (seq, batch, E)
+        # 但 router_logits 是 (B,S,E)，需要转换
+        route = router_logits.permute(1, 0, 2).contiguous()  # -> [S,B,E]
+
+        sorted_probs, sorted_indices = top_p_sampling_batched_all_sequence(
+            route, top_p=top_p, temperature=temperature
+        )   # sorted_probs: [S,B,E], sorted_indices: [S,B,E]
+
+        # cumulative probabilities (你函数内部 mask 了 top-p外的值)
+        cum = torch.cumsum(sorted_probs, dim=-1)             # [S,B,E]
+
+        # 找到 cum >= top_p 的最小 index
+        mask = cum >= top_p                                 # [S,B,E]
+        pseudo_k = mask.float().argmax(dim=-1) + 1          # [S,B]
+
+        # 转回 [B,S]
+        pseudo_k = pseudo_k.permute(1,0).contiguous()
+        # print(f"pseudo_k:{pseudo_k}")
+        # print(f"sorted_indices: {sorted_indices}")
+        return pseudo_k
     # ==========================================================
     # Forward：论文 Ada-K routing 的完整执行流程
     # ==========================================================
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, output_router_logits=False):
         """
         hidden_states: [B,S,H]
         returns:
@@ -1210,6 +1307,13 @@ class EnhancedSwitchMLP(nn.Module):
         router_logits = self.router(hidden_states).float()  # [B,S,E]
         # router_logits = torch.clamp(router_logits, -30, 30)
         router_logits = torch.nn.functional.softmax(router_logits, dim=2)
+        if output_router_logits:
+            # print(f"EnhancedSwitchMLP hidden_states: {hidden_states}")
+            # print(f"EnhancedSwitchMLP router_logits: {router_logits}")
+            return {
+                "hidden_states": hidden_states.detach(),
+                "router_logits": router_logits.detach(),
+            }
         # ------------------------------------------------------
         # 2. Allocator：预测 k 的分布（论文 §3.2）
         # ------------------------------------------------------
@@ -1238,31 +1342,6 @@ class EnhancedSwitchMLP(nn.Module):
             k=k_max,
             dim=-1
         )   # [B,S,k_max]
-        # print(f"topk_indices: {topk_indices}")
-        # print(f"topk_scores: {topk_scores}")
-        # # ------------------------------------------------------
-        # # 4. 按每个 token 的 k 做 mask
-        # # ------------------------------------------------------
-        # mask_j = torch.arange(k_max, device=hidden_states.device).view(1,1,k_max)
-        # mask = mask_j < (sampled_k.unsqueeze(-1) + 1)  # +1: index→数量
-
-        # topk_indices = topk_indices * mask + (~mask) * 0  # dummy expert idx
-
-        # # ------------------------------------------------------
-        # # 5. Expert Forward（论文 §3.1）
-        # # ------------------------------------------------------
-        # hidden_flat = hidden_states.reshape(-1, H)
-        # expert_idx_flat = topk_indices.reshape(-1, k_max)
-
-        # out_flat = torch.zeros_like(hidden_flat)
-
-        # for e in range(self.num_experts):
-        #     mask_e = (expert_idx_flat == e).any(dim=-1)
-        #     if mask_e.sum() == 0:
-        #         continue
-        #     out_flat[mask_e] += self.experts[e](hidden_flat[mask_e])
-
-        # outputs = out_flat.reshape(B, S, H)
 
 
         # ------------------------------------------------------
@@ -1285,19 +1364,6 @@ class EnhancedSwitchMLP(nn.Module):
         # ------------------------------------------------------
         # 6. 保存 PPO 信息 —— 分层存储
         # ------------------------------------------------------
-        # top_model = self.parent_model._moe_for_causal_lm
-        # top_model.ppo_buffer.append({
-        #     "layer_id": self.layer_num,  
-        #     "alloc_logits": alloc_logits.detach(),  # [B,S,K]
-        #     "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
-        #     "sampled_k":    sampled_k.detach(),     # [B,S]
-        # })
-        # self.ppo_buffer.append({
-        #     "layer_id": self.layer_num,  
-        #     "alloc_logits": alloc_logits.detach(),  # [B,S,K]
-        #     "alloc_probs":  alloc_probs.detach(),   # [B,S,K]
-        #     "sampled_k":    sampled_k.detach(),     # [B,S]
-        # })
         logits = alloc_logits            # [B,S,K]
         probs  = alloc_probs             # [B,S,K]
         log_probs = torch.log(probs + 1e-8)
@@ -1316,4 +1382,5 @@ class EnhancedSwitchMLP(nn.Module):
             "old_log_prob": old_log_prob.detach(),  # [B,S]
             "old_alloc_logits": alloc_logits.detach(),
         })
+        
         return output_total

@@ -1,11 +1,11 @@
 from transformers import AutoTokenizer
 import torch
-from Dynamic_MoE.modeling.modeling_moe import MoEForCausalLM
-from Dynamic_MoE.modeling.configuration_moe import MoEConfig
+from ADAK.modeling.modeling_moe import MoEForCausalLM
+from ADAK.modeling.configuration_moe import MoEConfig
 import json
 import torch.nn.functional as F
 import random
-from Dynamic_MoE.rl.rl import GeneticAlgorithm
+from ADAK.rl.rl import GeneticAlgorithm
 import numpy as np
 import os
 from datetime import datetime

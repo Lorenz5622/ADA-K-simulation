@@ -23,9 +23,9 @@ import torch.distributed as dist
 
 # --------- 你原来的 imports (保留) ----------
 from transformers import AutoTokenizer
-from Dynamic_MoE.modeling.modeling_moe import MoEForCausalLM
-from Dynamic_MoE.modeling.configuration_moe import MoEConfig
-from Dynamic_MoE.rl.rl import GeneticAlgorithm
+from ADAK.modeling.modeling_moe import MoEForCausalLM
+from ADAK.modeling.configuration_moe import MoEConfig
+from ADAK.rl.rl import GeneticAlgorithm
 import torch.nn.functional as F
 
 # --------- 可配置项（你可以按需要修改） ----------

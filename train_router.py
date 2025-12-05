@@ -4,7 +4,7 @@ from torch import nn
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 from datasets import load_dataset
 from datasets import concatenate_datasets
-from Dynamic_MoE.modeling.modeling_moe_adak import MoEForCausalLM
+from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
 
 # torchrun --nproc_per_node=1 train_router.py
 # ============================================================
@@ -32,7 +32,72 @@ def load_model(path):
 # ============================================================
 # 2. PPO Trainer（覆盖 HF backward）
 # ============================================================
+class WarmStartAllocatorTrainer(Trainer):
+    """Warm Start 阶段：对所有层的 allocator 做监督学习（由 Router Top-P 生成 pseudo-k）"""
 
+    def compute_loss(self, model, inputs):
+        real_model = model.module if hasattr(model, "module") else model
+
+        # ============================================================
+        # 1) 前向：让 MoEModel 返回所有 hidden_states + router_logits（所有层）
+        # ============================================================
+        outputs = real_model(**inputs, output_router_logits=True)
+
+        hidden_states_all = outputs["all_hidden_states_for_warm"]     # List[L] 每层 [B,S,H]
+        router_logits_all = outputs["all_router_logits_for_warm"]     # List[L] 每层 [B,S,E]
+
+        num_layers = real_model.num_layers
+        total_loss = 0.0
+        count = 0
+
+        # ============================================================
+        # 2) 逐层进行 warm-start 训练
+        # ============================================================
+        for layer_id in range(num_layers):
+
+            h = hidden_states_all[layer_id]                 # [B,S,H]
+            router_logits = router_logits_all[layer_id]     # [B,S,E]
+
+            # --------------------------------------------------------
+            # 2a. 使用你自定义 top-p 函数计算 pseudo-k
+            # --------------------------------------------------------
+            pseudo_k = real_model.model.layers[layer_id].mlp.compute_pseudo_k_top_p(
+                router_logits,
+                top_p=0.9,
+                temperature=1.0,
+            )  # [B,S]
+            
+
+            # --------------------------------------------------------
+            # 2b. 前向 allocator 得到 alloc_logits
+            # --------------------------------------------------------
+            alloc_logits, _ = real_model.model.layers[layer_id].mlp.allocator(h)  # [B,S,K]
+            B, S, K = alloc_logits.shape
+
+            # --- 修复方案：把 pseudo_k 映射到合法标签范围 ---
+            # 1) 限制为 1…max_k
+            pseudo_k = torch.clamp(pseudo_k, 1, K)
+
+            # 2) CE Loss 标签必须是 0…K-1，因此 shift 到 0-based
+            pseudo_k = pseudo_k - 1
+            # print(f"pseudo_k: {pseudo_k}")
+            # --------------------------------------------------------
+            # 2c. 计算 CrossEntropy loss
+            # --------------------------------------------------------
+            loss = nn.CrossEntropyLoss()(
+                alloc_logits.reshape(B * S, K),
+                pseudo_k.reshape(B * S)
+            )
+
+            total_loss += loss
+            count += 1
+
+        # ============================================================
+        # 3) 多层 loss 平均（论文中所有层应均等权）
+        # ============================================================
+        total_loss = total_loss / count
+
+        return total_loss
 class PPOTrainer(Trainer):
 
     def training_step(self, model, inputs):
@@ -198,7 +263,10 @@ def load_piqa(tokenizer):
     ds.set_format(type="torch",
                   columns=["input_ids", "attention_mask", "labels"])
     return ds
-
+def warm_start_dataset(dataset, ratio=0.1):
+    ds = dataset["train"]
+    n = int(len(ds) * ratio)
+    return {"train": ds.select(range(n))}
 
 # ============================================================
 # 4. 训练入口
@@ -228,17 +296,52 @@ def main():
     # all_train = concatenate_datasets([ds1, ds2, ds3])
     # dataset = {"train": all_train}
     dataset = load_piqa(tokenizer)
-    dataset = repeat_dataset(dataset, times=1)
-
+    # dataset = repeat_dataset(dataset, times=1)
+    warm_ds = warm_start_dataset(dataset, ratio=0.1)
+    # ====== Warm-Start 训练参数（小 lr、短 epoch） ======
+    warm_args = TrainingArguments(
+        output_dir=SAVE_PATH + "/warm",
+        learning_rate=5e-4,
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        logging_steps=20,
+        gradient_accumulation_steps=1,
+        bf16=True,
+        ddp_find_unused_parameters=False,
+    )
+    warm_trainer = WarmStartAllocatorTrainer(
+        model=model,
+        args=warm_args,
+        train_dataset=warm_ds["train"],
+        tokenizer=tokenizer,
+    )
+    print("===== Warm Start Training =====")
+    warm_trainer.train()
+    print("===== Warm Start Done =====")
+    warm_trainer.save_model(SAVE_PATH + "/warm_model")
+    tokenizer.save_pretrained(SAVE_PATH + "/warm_model")
     # =============== Trainer 设置 ===============
+
+    #----------------释放模型
+    del warm_trainer
+    del model
+    torch.cuda.empty_cache()
+    import gc
+    gc.collect()
+    torch.cuda.synchronize()
+
+    print("Loading warm-start model for PPO training...")
+    model = load_model(SAVE_PATH + "/warm_model")
+    tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH + "/warm_model")
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
-        learning_rate=1e-3,
+        learning_rate=5e-4,
         num_train_epochs=6,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
-        save_strategy="epoch",
-        logging_steps=20,
+        save_strategy="steps",
+        logging_steps=5000,
+        save_total_limit=3,
         ddp_find_unused_parameters=False,
         bf16=True,          # 强烈推荐
         tf32=True,          # 进一步提速

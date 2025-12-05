@@ -1,11 +1,11 @@
 from transformers import AutoTokenizer
 import torch
-from Dynamic_MoE.modeling.modeling_moe_adak import MoEForCausalLM
-from Dynamic_MoE.modeling.configuration_moe import MoEConfig
+from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
+from ADAK.modeling.configuration_moe import MoEConfig
 import json
 import torch.nn.functional as F
 import random
-from Dynamic_MoE.rl.rl import GeneticAlgorithm
+from ADAK.rl.rl import GeneticAlgorithm
 import numpy as np
 import os
 from datetime import datetime
@@ -21,7 +21,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
                 bos_token_id=tokenizer.bos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
-                max_new_tokens=16,top_p=0.9, temperature=1.0, do_sample=True)
+                max_new_tokens=256,top_p=0.9, temperature=1.0, do_sample=True)
     outputs = tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
     response = [outputs[i][len(inputs[i]):] for i in range(len(outputs))][0]
     return response    

@@ -1,0 +1,7 @@
+README.md
+setup.py
+ADAK/__init__.py
+ADAK.egg-info/PKG-INFO
+ADAK.egg-info/SOURCES.txt
+ADAK.egg-info/dependency_links.txt
+ADAK.egg-info/top_level.txt
