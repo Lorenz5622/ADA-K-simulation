@@ -157,11 +157,12 @@ class PPOTrainer(Trainer):
             #     [token_logp, torch.zeros(B,1, device=token_logp.device)],  # pad 最后一个位置
             #     dim=1
             # )  # → [B,S]
-            sequence_reward = token_logp.sum(dim=1) / (shift_labels != -100).sum(dim=1)
-            # sequence_reward = (sequence_reward - sequence_reward.mean()) / (sequence_reward.std() + 1e-6)
-            # sequence_reward = sequence_reward.float()    # 强制 float32 避免被 bf16 截断
-            sequence_reward = sequence_reward - sequence_reward.mean()
-            reward = sequence_reward.unsqueeze(1).repeat(1, labels.size(1))
+            # sequence_reward = token_logp.sum(dim=1) / (shift_labels != -100).sum(dim=1)
+            # sequence_reward = sequence_reward - sequence_reward.mean()
+            # reward = sequence_reward.unsqueeze(1).repeat(1, labels.size(1))
+            reward = token_logp.clone()
+            reward = torch.clamp(reward, -10, 10)
+            
 
             print(f"[Reward] {reward.mean().item()} ")
 
@@ -191,8 +192,8 @@ class PPOTrainer(Trainer):
         # -------------------------
         ppo_batches = []
         last_layer = real_model.num_layers - 1
-
-        for item in ppo_data:
+        saved_old_probs = [None for _ in range(len(ppo_data))]
+        for idx, item in enumerate(ppo_data):
             layer_id = item["layer_id"]
 
             # if layer_id == last_layer:
@@ -201,15 +202,26 @@ class PPOTrainer(Trainer):
             #     adv = torch.zeros_like(advantage)   # 其它层=0
             layer_distance = last_layer - layer_id
             adv = advantage * (0.9 ** layer_distance)
+            if saved_old_probs[idx] != None:
+                ppo_batches.append({
+                    "layer_id": item["layer_id"],
+                    "state": item["state"],               # [B,S,H]
+                    "action": item["action"],             # [B,S]
+                    "old_log_prob": saved_old_probs[idx], # [B,S]
+                    "advantage": adv,                     # [B,1]
+                    "old_alloc_logits": item["old_alloc_logits"],
+                })
+            else:
+                ppo_batches.append({
+                    "layer_id": item["layer_id"],
+                    "state": item["state"],               # [B,S,H]
+                    "action": item["action"],             # [B,S]
+                    "old_log_prob": item["old_log_prob"], # [B,S]
+                    "advantage": adv,                     # [B,1]
+                    "old_alloc_logits": item["old_alloc_logits"],
+                })
+            saved_old_probs[idx] = item["old_log_prob"]
 
-            ppo_batches.append({
-                "layer_id": item["layer_id"],
-                "state": item["state"],               # [B,S,H]
-                "action": item["action"],             # [B,S]
-                "old_log_prob": item["old_log_prob"], # [B,S]
-                "advantage": adv,                     # [B,1]
-                "old_alloc_logits": item["old_alloc_logits"],
-            })
 
 
         # -------------------------

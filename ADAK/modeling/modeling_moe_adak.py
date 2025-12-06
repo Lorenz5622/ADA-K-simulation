@@ -790,8 +790,9 @@ class MoEForCausalLM(MoEPreTrainedModel):
             # probs:  [B,S,K]
             # log_probs: [B,S,K]
             entropy = -(probs * log_probs).sum(dim=-1).mean()    # scalar
-            with torch.no_grad():
-                old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
+            # with torch.no_grad():
+            #     old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
+            old_log_probs = torch.log_softmax(log_probs, dim=-1)
             # --- KL penalty (new vs old) -------------------------
             # 需要 old_log_probs 展开成 shape [B,S,K]
             kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
@@ -1475,9 +1476,9 @@ class EnhancedSwitchMLP(nn.Module):
         # 保存完整 PPO 轨迹
         self.ppo_buffer.append({
             "layer_id": self.layer_num,
-            "state": hidden_states.detach(),   # [B,S,H]
+            "state": hidden_states.detach().float(),   # [B,S,H]
             "action": sampled_k.detach(),      # [B,S]
-            "old_log_prob": old_log_prob.detach(),  # [B,S]
+            "old_log_prob": old_log_prob.detach().float(),  # [B,S]
             "old_alloc_logits": alloc_logits.detach(),
         })
         
