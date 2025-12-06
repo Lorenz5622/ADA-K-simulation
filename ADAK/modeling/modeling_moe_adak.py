@@ -35,7 +35,8 @@ import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 
 logger = logging.get_logger(__name__)
-
+KL_PENALTY_RATIO = 0.01
+ENTROPY_RATIO = 0.2
 _CONFIG_FOR_DOC = "LlamaConfig"
 MAX_K = 6
 test_flag = False # 为true给训练使用
@@ -796,13 +797,13 @@ class MoEForCausalLM(MoEPreTrainedModel):
             kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
 
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
-            loss = ppo_loss - 0.05 * entropy + 0.1 * kl
+            loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
             if layer_id == 23:
                 print(f"[PPO] layer={layer_id} | "
-                f"ppo_loss={ppo_loss.item():.4f} | "
-                f"entropy={entropy.item():.4f} | "
-                f"kl={kl.item():.4f} | "
-                f"loss={loss.item():.4f}")
+                f"ppo_loss={ppo_loss.item():.5f} | "
+                f"entropy={entropy.item():.5f} | "
+                f"kl={kl.item():.5f} | "
+                f"loss={loss.item():.5f}")
             total_loss += loss
 
         # 6) 反向传播
@@ -1103,85 +1104,85 @@ class LlamaForSequenceClassification(MoEPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-class ExpertSelector(nn.Module):
-    """
-    专家选择器，用于根据hidden_states选择最佳专家
-    """
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_experts = config.num_experts
+# class ExpertSelector(nn.Module):
+#     """
+#     专家选择器，用于根据hidden_states选择最佳专家
+#     """
+#     def __init__(self, config):
+#         super().__init__()
+#         self.hidden_size = config.hidden_size
+#         self.num_experts = config.num_experts
         
-        # 创建路由线性层，将hidden_states映射到专家概率分布
-        self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
+#         # 创建路由线性层，将hidden_states映射到专家概率分布
+#         self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
         
-        # 初始化权重
-        self._init_weights()
+#         # 初始化权重
+#         self._init_weights()
     
-    def _init_weights(self):
-        """
-        初始化路由器权重
-        """
-        # 使用较小的标准差初始化，避免极端概率
-        torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
+#     def _init_weights(self):
+#         """
+#         初始化路由器权重
+#         """
+#         # 使用较小的标准差初始化，避免极端概率
+#         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
     
-    def forward(self, hidden_states):
-        """
-        返回用于 MoE 路由的:
-            probs: [B,S,E]
-            sampled_k: [B,S]
+#     def forward(self, hidden_states):
+#         """
+#         返回用于 MoE 路由的:
+#             probs: [B,S,E]
+#             sampled_k: [B,S]
 
-        返回给 PPO 的:
-            ppo_info = {
-                "state": hidden_states.detach(),
-                "action": sampled_k.detach(),
-                "log_prob": log_prob_k.detach(),
-                "pi_prob": probs.detach(),
-            }
-        """
-        logits = self.router(hidden_states).float()
-        logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits 范围，绝不溢出
-        probs  = torch.softmax(logits, dim=-1)
+#         返回给 PPO 的:
+#             ppo_info = {
+#                 "state": hidden_states.detach(),
+#                 "action": sampled_k.detach(),
+#                 "log_prob": log_prob_k.detach(),
+#                 "pi_prob": probs.detach(),
+#             }
+#         """
+#         logits = self.router(hidden_states).float()
+#         logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits 范围，绝不溢出
+#         probs  = torch.softmax(logits, dim=-1)
 
-        # 非可微采样动作（保持不变）
-        sampled_k = torch.multinomial(
-            probs.view(-1, self.num_experts),
-            1
-        ).view(hidden_states.shape[:-1])             # [B,S]
+#         # 非可微采样动作（保持不变）
+#         sampled_k = torch.multinomial(
+#             probs.view(-1, self.num_experts),
+#             1
+#         ).view(hidden_states.shape[:-1])             # [B,S]
 
-        # 计算 log_prob(action)
-        log_probs = torch.log(probs + 1e-8)
-        log_prob_k = torch.gather(
-            log_probs,
-            dim=-1,
-            index=sampled_k.unsqueeze(-1)
-        ).squeeze(-1)                                # [B,S]
+#         # 计算 log_prob(action)
+#         log_probs = torch.log(probs + 1e-8)
+#         log_prob_k = torch.gather(
+#             log_probs,
+#             dim=-1,
+#             index=sampled_k.unsqueeze(-1)
+#         ).squeeze(-1)                                # [B,S]
 
-        # 生成 PPO 信息
-        ppo_info = {
-            "state": hidden_states.detach(),     # 状态 s
-            "action": sampled_k.detach(),        # 动作 a
-            "log_prob": log_prob_k.detach(),     # log π_old(a|s)
-            "pi_prob": probs.detach(),           # π_old 概率分布（用于重要性采样）
-        }
+#         # 生成 PPO 信息
+#         ppo_info = {
+#             "state": hidden_states.detach(),     # 状态 s
+#             "action": sampled_k.detach(),        # 动作 a
+#             "log_prob": log_prob_k.detach(),     # log π_old(a|s)
+#             "pi_prob": probs.detach(),           # π_old 概率分布（用于重要性采样）
+#         }
 
-        return probs, sampled_k, ppo_info
+#         return probs, sampled_k, ppo_info
     
-    def compute_routing_entropy(self, hidden_states):
-        """
-        计算路由熵，衡量专家选择的多样性
+#     def compute_routing_entropy(self, hidden_states):
+#         """
+#         计算路由熵，衡量专家选择的多样性
         
-        Args:
-            hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
+#         Args:
+#             hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
             
-        Returns:
-            entropy: 标量，路由熵值
-        """
-        _, probs = self.forward(hidden_states)
+#         Returns:
+#             entropy: 标量，路由熵值
+#         """
+#         _, probs = self.forward(hidden_states)
         
-        # 计算熵: -sum(p * log(p))
-        entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-        return torch.mean(entropy)
+#         # 计算熵: -sum(p * log(p))
+#         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+#         return torch.mean(entropy)
 
 
 class AdaKAllocator(nn.Module):
@@ -1212,6 +1213,9 @@ class AdaKAllocator(nn.Module):
         logits = torch.clamp(logits, -30, 30)   # avoid softmax overflow
         probs = F.softmax(logits, dim=-1)
         probs = torch.clamp(probs, 1e-8, 1.0)
+
+        logits = logits.to(hidden_states.dtype)
+        probs = probs.to(hidden_states.dtype)
         return logits, probs
 
 class EnhancedSwitchMLP(nn.Module):
@@ -1320,10 +1324,11 @@ class EnhancedSwitchMLP(nn.Module):
         alloc_logits, alloc_probs = self.allocator(hidden_states)   # [B,S,K]
         # print("MLP training:", self.training)
         # 采样 k （论文使用 REINFORCE/PPO）
-        sampled_k = torch.multinomial(
-            alloc_probs.view(-1, self.max_k),
-            num_samples=1
-        ).view(B, S)  # [B,S], 取值范围 0~max_k-1
+        # sampled_k = torch.multinomial(
+        #     alloc_probs.view(-1, self.max_k),
+        #     num_samples=1
+        # ).view(B, S)  # [B,S], 取值范围 0~max_k-1
+        sampled_k = alloc_probs.argmax(dim=-1)
         if self.training:
             # 在线统计直方图，不保存所有 token 的 k
             if not hasattr(self, "k_hist"):

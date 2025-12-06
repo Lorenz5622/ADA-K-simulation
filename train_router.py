@@ -143,7 +143,10 @@ class PPOTrainer(Trainer):
             # ---- Shift: LM 预测下一个 token ----
             shift_logits = logits[:, :-1]          # predict labels[:,1:]
             shift_labels = labels[:, 1:]
-
+            # print(f"shift_labels: {shift_labels}")
+            # print(f"shift_logits: {shift_logits}")
+            # print(f"shift_labels.shape: {shift_labels.shape}")
+            # print(f"shift_logits.shape: {shift_logits.shape}")
             log_probs = torch.log_softmax(shift_logits, dim=-1)
             token_logp = torch.gather(
                 log_probs, -1, shift_labels.unsqueeze(-1)
@@ -152,16 +155,17 @@ class PPOTrainer(Trainer):
             # ---- mask padding tokens ----
             token_logp = token_logp * (shift_labels != -100)
 
-            # ---- 最后一个有效 token 的 logP ----
-            reward = token_logp.clone()             # [B,S-1]
-            reward = torch.clamp(reward, -50, 50)   # optional
-            reward = torch.cat(
-                [reward, torch.zeros(B,1, device=reward.device)],  # pad 最后一个位置
-                dim=1
-            )  # → [B,S]
-            print(f"[Reward] mean={reward.mean().item():.4f} "
-            f"max={reward.max().item():.4f} "
-            f"min={reward.min().item():.4f}")
+            # reward = token_logp.clone()             # [B,S-1]
+            # reward = torch.clamp(reward, -50, 50)   # optional
+            # reward = torch.cat(
+            #     [token_logp, torch.zeros(B,1, device=token_logp.device)],  # pad 最后一个位置
+            #     dim=1
+            # )  # → [B,S]
+            sequence_reward = token_logp.sum(dim=1) / (shift_labels != -100).sum(dim=1)
+            sequence_reward = (sequence_reward - sequence_reward.mean()) / (sequence_reward.std() + 1e-6)
+            reward = sequence_reward.unsqueeze(1).repeat(1, labels.size(1))
+            
+            print(f"[Reward] mean={reward.mean().item():.4f} ")
 
             # # ---- PPO 稳定 clip ----
             # reward = torch.clamp(reward, -50, 50)
@@ -193,10 +197,12 @@ class PPOTrainer(Trainer):
         for item in ppo_data:
             layer_id = item["layer_id"]
 
-            if layer_id == last_layer:
-                adv = advantage          # 论文要求：最后一层=真实奖励
-            else:
-                adv = torch.zeros_like(advantage)   # 其它层=0
+            # if layer_id == last_layer:
+            #     adv = advantage          # 论文要求：最后一层=真实奖励
+            # else:
+            #     adv = torch.zeros_like(advantage)   # 其它层=0
+            layer_distance = last_layer - layer_id
+            adv = advantage * (0.9 ** layer_distance)
 
             ppo_batches.append({
                 "layer_id": item["layer_id"],
@@ -279,8 +285,10 @@ def repeat_dataset(ds, times=5):
 def main():
 
     PATH_PREFIX = "/root"
-    if os.path.exists("/home/cyx"):
-        PATH_PREFIX = "/home/cyx"
+    # if os.path.exists("/home/cyx"):
+    #     PATH_PREFIX = "/home/cyx"
+    if os.path.exists("/data"):
+        PATH_PREFIX = "/data/cyx"
 
     MODEL_PATH = f"{PATH_PREFIX}/models/Dynamic_MoE"
     SAVE_PATH = f"{PATH_PREFIX}/models/ADAK_MoE"
@@ -297,7 +305,7 @@ def main():
     # dataset = {"train": all_train}
     dataset = load_piqa(tokenizer)
     # dataset = repeat_dataset(dataset, times=1)
-    warm_ds = warm_start_dataset(dataset, ratio=0.1)
+    warm_ds = warm_start_dataset(dataset, ratio=0.2)
     # ====== Warm-Start 训练参数（小 lr、短 epoch） ======
     warm_args = TrainingArguments(
         output_dir=SAVE_PATH + "/warm",
@@ -306,6 +314,7 @@ def main():
         per_device_train_batch_size=4,
         logging_steps=20,
         gradient_accumulation_steps=1,
+        save_total_limit=1,
         bf16=True,
         ddp_find_unused_parameters=False,
     )
@@ -320,6 +329,11 @@ def main():
     print("===== Warm Start Done =====")
     warm_trainer.save_model(SAVE_PATH + "/warm_model")
     tokenizer.save_pretrained(SAVE_PATH + "/warm_model")
+    if os.path.exists(SAVE_PATH + "/warm"):
+        from pathlib import Path
+        import shutil
+        folder = Path(SAVE_PATH + "/warm")
+        shutil.rmtree(folder)
     # =============== Trainer 设置 ===============
 
     #----------------释放模型
@@ -341,7 +355,7 @@ def main():
         gradient_accumulation_steps=4,
         save_strategy="steps",
         logging_steps=5000,
-        save_total_limit=3,
+        save_total_limit=1,
         ddp_find_unused_parameters=False,
         bf16=True,          # 强烈推荐
         tf32=True,          # 进一步提速
@@ -360,6 +374,7 @@ def main():
 
     print("Saving model...")
     model.save_pretrained(SAVE_PATH)
+    tokenizer.save_pretrained(SAVE_PATH)
     print("Done.")
 
 
