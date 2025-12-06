@@ -797,11 +797,11 @@ class MoEForCausalLM(MoEPreTrainedModel):
             kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
 
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
-            loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
+            # loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
+            loss = ppo_loss + KL_PENALTY_RATIO * kl
             if layer_id == 23:
                 print(f"[PPO] layer={layer_id} | "
                 f"ppo_loss={ppo_loss.item():.5f} | "
-                f"entropy={entropy.item():.5f} | "
                 f"kl={kl.item():.5f} | "
                 f"loss={loss.item():.5f}")
             total_loss += loss
@@ -1214,9 +1214,83 @@ class AdaKAllocator(nn.Module):
         probs = F.softmax(logits, dim=-1)
         probs = torch.clamp(probs, 1e-8, 1.0)
 
-        logits = logits.to(hidden_states.dtype)
-        probs = probs.to(hidden_states.dtype)
+        # logits = logits.to(hidden_states.dtype)
+        # probs = probs.to(hidden_states.dtype)
         return logits, probs
+
+def dynamic_topk_indices_and_scores(router_logits, sampled_k):
+    """
+    router_logits: [B, S, E]
+    sampled_k: [B, S]
+
+    返回：
+        topk_indices_full: [B, S, E]
+            若 expert e 被选中 → e
+            未选中 → -1
+        selected_scores: [B, S, E]
+            选中专家保留 logits 分数
+            未选中 → 0
+    """
+
+    B, S, E = router_logits.shape
+    logits = router_logits.clone()
+    max_k = min(sampled_k.max().item(), MAX_K)
+
+    # 保存 top-k 轮次选中 expert index，长度 max_k，每个是 [B,S]
+    all_indices = []
+    active_mask = sampled_k > 0
+
+    for _ in range(max_k):
+        # 当前最大 expert id
+        idx = logits.argmax(dim=-1)  # [B, S]
+
+        idx = torch.where(active_mask, idx, torch.full_like(idx, -1))
+        all_indices.append(idx)
+
+        # 屏蔽被选中的 expert
+        safe = idx.clone()
+        safe[safe == -1] = 0
+        logits.scatter_(dim=-1, index=safe.unsqueeze(-1), value=float('-inf'))
+
+        sampled_k -= 1
+        active_mask = sampled_k > 0
+
+    # all_indices → [B,S,max_k]
+    topk_indices = torch.stack(all_indices, dim=-1)
+
+    # ---- 你要求的对位格式 ----
+    # 初始化为 -1
+    topk_indices_full = torch.full(
+        (B, S, E),
+        fill_value=-1,
+        device=router_logits.device,
+        dtype=torch.long
+    )
+
+    # 对于每一轮，将 selected expert index 写到对应位置
+    for i in range(max_k):
+        idx_i = topk_indices[..., i]  # [B,S]
+        valid = idx_i != -1
+
+        if valid.any():
+            # scatter 的 index 必须转成 [B,S,1]
+            safe_idx = idx_i.clone()
+            safe_idx = torch.clamp(safe_idx, 0, E-1)
+
+            topk_indices_full.scatter_(
+                dim=-1,
+                index=safe_idx.unsqueeze(-1),
+                src=safe_idx.unsqueeze(-1)   # expert_id 对位写入
+            )
+
+    # ---- selected_scores: 对位填概率 ----
+    selected_scores = torch.where(
+        topk_indices_full != -1,
+        router_logits,
+        torch.zeros_like(router_logits)
+    )
+
+    return topk_indices_full, selected_scores
 
 class EnhancedSwitchMLP(nn.Module):
     """
@@ -1329,25 +1403,44 @@ class EnhancedSwitchMLP(nn.Module):
         #     num_samples=1
         # ).view(B, S)  # [B,S], 取值范围 0~max_k-1
         sampled_k = alloc_probs.argmax(dim=-1)
+
+
+        # 处理sampled_k
+        # sorted_probs, sorted_indices = torch.sort(router_logits, descending=True)
+        # print(f"sampled_k: {sampled_k}")
+        sampled_k_action = sampled_k.clone()
+        true_k = torch.clamp(sampled_k_action + 1, max=self.max_k)
+        topk_indices, topk_scores = dynamic_topk_indices_and_scores(router_logits=router_logits, sampled_k=true_k,)
+        # router_B, router_S, router_E = router_logits.shape
+        # indices = torch.arange(router_E, device=router_logits.device).repeat(router_B, router_S, 1)
+        # mask = torch.ones(router_B,router_S,router_E, dtype=torch.bool, device=hidden_states.device)
+        # print(f"alloc_probs: {alloc_probs}")
+        # print(f"alloc_probs.shape: {alloc_probs.shape}")
+        # print(f"sampled_k: {sampled_k}")
+        # print(f"sample_k.shape: {sampled_k.shape}")
+        # for i in range(router_B):
+        #     for j in range(router_S):
+        #         k = sampled_k[i, j].item()
+        #         if k <= 0:
+        #             continue
+        #         topkk = min(k, 6)  # 防止越界
+        #         # top_indices = sorted_indices[i, j, :k]  # 利用已排序的 indices
+        #         top_indices = torch.topk(router_logits[i,j], topkk).indices
+        #         for k_indice in top_indices:
+        #             mask[i, j, k_indice] = False
+                # print(f"top_indices: {top_indices}")
+        
+        # topk_indices = torch.where(mask, -1, indices)
+        # topk_scores = torch.where(mask, 0.0, router_logits)
+        
         if self.training:
             # 在线统计直方图，不保存所有 token 的 k
             if not hasattr(self, "k_hist"):
                 self.k_hist = torch.zeros(self.max_k, device=hidden_states.device)
 
             # sampled_k ∈ [0..K-1]
-            bcount = torch.bincount(sampled_k.reshape(-1), minlength=self.max_k)
+            bcount = torch.bincount(sampled_k_action.reshape(-1), minlength=self.max_k)
             self.k_hist += bcount
-        # ------------------------------------------------------
-        # 3. Router：对专家打分并排序
-        # ------------------------------------------------------
-        # 取得所有 expert 的排序结果（最大 K）
-        k_max = sampled_k.max().item() + 1   # 采样的 k 是 index，需要 +1 才是数量
-        topk_scores, topk_indices = torch.topk(
-            router_logits,
-            k=k_max,
-            dim=-1
-        )   # [B,S,k_max]
-
 
         # ------------------------------------------------------
         # 4 new. 模仿原模型的output方式处理

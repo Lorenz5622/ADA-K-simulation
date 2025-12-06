@@ -1,6 +1,6 @@
 from transformers import AutoTokenizer
 import torch
-from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
+from ADAK.modeling.modeling_moe_ori import MoEForCausalLM
 from ADAK.modeling.configuration_moe import MoEConfig
 import json
 import torch.nn.functional as F
@@ -31,7 +31,7 @@ def generate(tokenizer, model, text, dynamic_k=None):
 if __name__ == "__main__":
     if os.path.exists("/home/cyx") :
         PATH_PREFIX = "/home/cyx"
-    model_path = f'{PATH_PREFIX}/models/ADAK_MoE'
+    model_path = f'{PATH_PREFIX}/models/Dynamic_MoE'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     tokenizer.pad_token = tokenizer.unk_token
 

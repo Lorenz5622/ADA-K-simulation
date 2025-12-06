@@ -143,10 +143,6 @@ class PPOTrainer(Trainer):
             # ---- Shift: LM 预测下一个 token ----
             shift_logits = logits[:, :-1]          # predict labels[:,1:]
             shift_labels = labels[:, 1:]
-            # print(f"shift_labels: {shift_labels}")
-            # print(f"shift_logits: {shift_logits}")
-            # print(f"shift_labels.shape: {shift_labels.shape}")
-            # print(f"shift_logits.shape: {shift_logits.shape}")
             log_probs = torch.log_softmax(shift_logits, dim=-1)
             token_logp = torch.gather(
                 log_probs, -1, shift_labels.unsqueeze(-1)
@@ -162,10 +158,12 @@ class PPOTrainer(Trainer):
             #     dim=1
             # )  # → [B,S]
             sequence_reward = token_logp.sum(dim=1) / (shift_labels != -100).sum(dim=1)
-            sequence_reward = (sequence_reward - sequence_reward.mean()) / (sequence_reward.std() + 1e-6)
+            # sequence_reward = (sequence_reward - sequence_reward.mean()) / (sequence_reward.std() + 1e-6)
+            # sequence_reward = sequence_reward.float()    # 强制 float32 避免被 bf16 截断
+            sequence_reward = sequence_reward - sequence_reward.mean()
             reward = sequence_reward.unsqueeze(1).repeat(1, labels.size(1))
-            
-            print(f"[Reward] mean={reward.mean().item():.4f} ")
+
+            print(f"[Reward] {reward.mean().item()} ")
 
             # # ---- PPO 稳定 clip ----
             # reward = torch.clamp(reward, -50, 50)
@@ -184,7 +182,7 @@ class PPOTrainer(Trainer):
         # 3. 计算 advantage（可选：标准化）
         # -------------------------
         advantage = reward - reward.mean(dim=1, keepdim=True)
-        std = advantage.std(dim=1, keepdim=True) + 1e-6
+        std = advantage.std(dim=1, keepdim=True)
         advantage = advantage / std     # [B,S]
 
 
@@ -305,7 +303,7 @@ def main():
     # dataset = {"train": all_train}
     dataset = load_piqa(tokenizer)
     # dataset = repeat_dataset(dataset, times=1)
-    warm_ds = warm_start_dataset(dataset, ratio=0.2)
+    warm_ds = warm_start_dataset(dataset, ratio=0.1)
     # ====== Warm-Start 训练参数（小 lr、短 epoch） ======
     warm_args = TrainingArguments(
         output_dir=SAVE_PATH + "/warm",
