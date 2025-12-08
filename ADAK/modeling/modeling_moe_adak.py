@@ -789,13 +789,15 @@ class MoEForCausalLM(MoEPreTrainedModel):
             # --- Entropy bonus -----------------------------------
             # probs:  [B,S,K]
             # log_probs: [B,S,K]
+            old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
             entropy = -(probs * log_probs).sum(dim=-1).mean()    # scalar
-            # with torch.no_grad():
-            #     old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
-            old_log_probs = torch.log_softmax(log_probs, dim=-1)
+            
             # --- KL penalty (new vs old) -------------------------
             # 需要 old_log_probs 展开成 shape [B,S,K]
-            kl = (probs * (log_probs - old_log_probs)).sum(dim=-1).mean()
+            old_log_probs_full = torch.log_softmax(old_alloc_logits, dim=-1)      # [B,S,K]
+            log_probs_new_full = torch.log(probs + 1e-8)                      # [B,S,K]
+
+            kl = (probs * (log_probs_new_full - old_log_probs_full)).sum(dim=-1).mean()
 
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
             # loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
