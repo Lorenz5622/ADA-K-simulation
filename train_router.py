@@ -10,6 +10,10 @@ from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
 # ============================================================
 # 1. 载入模型（必须是你修改后的 allocator 版本）
 # ============================================================
+
+
+# TODO 加一个ACTOR-CRITIC
+# 李宏毅PPO
 def load_model(path):
     print("Loading model:", path)
     model = MoEForCausalLM.from_pretrained(path)
@@ -99,6 +103,8 @@ class WarmStartAllocatorTrainer(Trainer):
 
         return total_loss
 class PPOTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        self.reward_history = []
 
     def training_step(self, model, inputs):
         """
@@ -151,7 +157,8 @@ class PPOTrainer(Trainer):
             # ---- mask padding tokens ----
             token_logp = token_logp * (shift_labels != -100)
             reward = torch.clamp(token_logp, -10, 10)
-            reward = torch.nn.functional.pad(reward, pad=(1, 0), mode="constant", value=0.0)
+            # TODO pad是否正确？
+            reward = torch.nn.functional.pad(reward, pad=(0, 1), mode="constant", value=0.0)
             
 
             print(f"[Reward] {reward.mean().item()} ")
@@ -232,6 +239,7 @@ class PPOTrainer(Trainer):
         # -------------------------
         # 6. 返回 LM loss（不影响 PPO）
         # -------------------------
+        self.reward_history.append(reward.mean().item())
         return lm_loss
 
 
@@ -335,6 +343,7 @@ def main():
     print("Loading warm-start model for PPO training...")
     model = load_model(SAVE_PATH + "/warm_model")
     tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH + "/warm_model")
+    # TODO 改大num_train_epochs
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
         learning_rate=5e-4,
@@ -364,6 +373,10 @@ def main():
     model.save_pretrained(SAVE_PATH)
     tokenizer.save_pretrained(SAVE_PATH)
     print("Done.")
+
+    import json
+    with open(os.path.join(SAVE_PATH, "reward_history.json"), "w") as f:
+        json.dump(trainer.reward_history, f)
 
 
 if __name__ == "__main__":
