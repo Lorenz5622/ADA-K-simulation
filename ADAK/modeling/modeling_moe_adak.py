@@ -1107,92 +1107,13 @@ class LlamaForSequenceClassification(MoEPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-# class ExpertSelector(nn.Module):
-#     """
-#     专家选择器，用于根据hidden_states选择最佳专家
-#     """
-#     def __init__(self, config):
-#         super().__init__()
-#         self.hidden_size = config.hidden_size
-#         self.num_experts = config.num_experts
-        
-#         # 创建路由线性层，将hidden_states映射到专家概率分布
-#         self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-        
-#         # 初始化权重
-#         self._init_weights()
-    
-#     def _init_weights(self):
-#         """
-#         初始化路由器权重
-#         """
-#         # 使用较小的标准差初始化，避免极端概率
-#         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
-    
-#     def forward(self, hidden_states):
-#         """
-#         返回用于 MoE 路由的:
-#             probs: [B,S,E]
-#             sampled_k: [B,S]
-
-#         返回给 PPO 的:
-#             ppo_info = {
-#                 "state": hidden_states.detach(),
-#                 "action": sampled_k.detach(),
-#                 "log_prob": log_prob_k.detach(),
-#                 "pi_prob": probs.detach(),
-#             }
-#         """
-#         logits = self.router(hidden_states).float()
-#         logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits 范围，绝不溢出
-#         probs  = torch.softmax(logits, dim=-1)
-
-#         # 非可微采样动作（保持不变）
-#         sampled_k = torch.multinomial(
-#             probs.view(-1, self.num_experts),
-#             1
-#         ).view(hidden_states.shape[:-1])             # [B,S]
-
-#         # 计算 log_prob(action)
-#         log_probs = torch.log(probs + 1e-8)
-#         log_prob_k = torch.gather(
-#             log_probs,
-#             dim=-1,
-#             index=sampled_k.unsqueeze(-1)
-#         ).squeeze(-1)                                # [B,S]
-
-#         # 生成 PPO 信息
-#         ppo_info = {
-#             "state": hidden_states.detach(),     # 状态 s
-#             "action": sampled_k.detach(),        # 动作 a
-#             "log_prob": log_prob_k.detach(),     # log π_old(a|s)
-#             "pi_prob": probs.detach(),           # π_old 概率分布（用于重要性采样）
-#         }
-
-#         return probs, sampled_k, ppo_info
-    
-#     def compute_routing_entropy(self, hidden_states):
-#         """
-#         计算路由熵，衡量专家选择的多样性
-        
-#         Args:
-#             hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
-            
-#         Returns:
-#             entropy: 标量，路由熵值
-#         """
-#         _, probs = self.forward(hidden_states)
-        
-#         # 计算熵: -sum(p * log(p))
-#         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-#         return torch.mean(entropy)
-
 
 class AdaKAllocator(nn.Module):
     """
     Per-layer allocator W_alloc in the paper.
     Computes P(k | h) for dynamic top-k expert routing.
     """
+    # TODO 再加一层隐藏
     def __init__(self, hidden_size, max_k, hidden_dim = None):
         super().__init__()
         self.max_k = max_k
@@ -1366,8 +1287,6 @@ class EnhancedSwitchMLP(nn.Module):
 
         # 转回 [B,S]
         pseudo_k = pseudo_k.permute(1,0).contiguous()
-        # print(f"pseudo_k:{pseudo_k}")
-        # print(f"sorted_indices: {sorted_indices}")
         return pseudo_k
     # ==========================================================
     # Forward：论文 Ada-K routing 的完整执行流程
@@ -1389,8 +1308,6 @@ class EnhancedSwitchMLP(nn.Module):
         # router_logits = torch.clamp(router_logits, -30, 30)
         router_logits = torch.nn.functional.softmax(router_logits, dim=2)
         if output_router_logits:
-            # print(f"EnhancedSwitchMLP hidden_states: {hidden_states}")
-            # print(f"EnhancedSwitchMLP router_logits: {router_logits}")
             return {
                 "hidden_states": hidden_states.detach(),
                 "router_logits": router_logits.detach(),
@@ -1401,40 +1318,15 @@ class EnhancedSwitchMLP(nn.Module):
         alloc_logits, alloc_probs = self.allocator(hidden_states)   # [B,S,K]
         # print("MLP training:", self.training)
         # 采样 k （论文使用 REINFORCE/PPO）
-        # sampled_k = torch.multinomial(
-        #     alloc_probs.view(-1, self.max_k),
-        #     num_samples=1
-        # ).view(B, S)  # [B,S], 取值范围 0~max_k-1
+
+        # TODO 随机采样，依概率随机
         sampled_k = alloc_probs.argmax(dim=-1)
 
 
         # 处理sampled_k
-        # sorted_probs, sorted_indices = torch.sort(router_logits, descending=True)
-        # print(f"sampled_k: {sampled_k}")
         sampled_k_action = sampled_k.clone()
         true_k = torch.clamp(sampled_k_action + 1, max=self.max_k)
         topk_indices, topk_scores = dynamic_topk_indices_and_scores(router_logits=router_logits, sampled_k=true_k,)
-        # router_B, router_S, router_E = router_logits.shape
-        # indices = torch.arange(router_E, device=router_logits.device).repeat(router_B, router_S, 1)
-        # mask = torch.ones(router_B,router_S,router_E, dtype=torch.bool, device=hidden_states.device)
-        # print(f"alloc_probs: {alloc_probs}")
-        # print(f"alloc_probs.shape: {alloc_probs.shape}")
-        # print(f"sampled_k: {sampled_k}")
-        # print(f"sample_k.shape: {sampled_k.shape}")
-        # for i in range(router_B):
-        #     for j in range(router_S):
-        #         k = sampled_k[i, j].item()
-        #         if k <= 0:
-        #             continue
-        #         topkk = min(k, 6)  # 防止越界
-        #         # top_indices = sorted_indices[i, j, :k]  # 利用已排序的 indices
-        #         top_indices = torch.topk(router_logits[i,j], topkk).indices
-        #         for k_indice in top_indices:
-        #             mask[i, j, k_indice] = False
-                # print(f"top_indices: {top_indices}")
-        
-        # topk_indices = torch.where(mask, -1, indices)
-        # topk_scores = torch.where(mask, 0.0, router_logits)
         
         if self.training:
             # 在线统计直方图，不保存所有 token 的 k
