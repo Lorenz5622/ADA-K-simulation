@@ -35,8 +35,8 @@ import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 
 logger = logging.get_logger(__name__)
-ACTOR_LR = 5e-4
-CRITIC_LR = 5e-4
+ACTOR_LR = 1e-3
+CRITIC_LR = 1e-3
 KL_PENALTY_RATIO = 0.02
 ENTROPY_RATIO = 0.1
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -678,12 +678,12 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
     def get_decoder(self):
         return self.model
-    def get_allocator_params(self):
-        params = []
-        for layer in self.model.layers:
-            if hasattr(layer.mlp, "allocator"):
-                params += list(layer.mlp.allocator.parameters())
-        return params
+    # def get_allocator_params(self):
+    #     params = []
+    #     for layer in self.model.layers:
+    #         if hasattr(layer.mlp, "allocator"):
+    #             params += list(layer.mlp.allocator.parameters())
+    #     return params
     
     def get_actor_critic_params(self):
         params = []
@@ -703,16 +703,6 @@ class MoEForCausalLM(MoEPreTrainedModel):
         total_loss = 0.0
         actor_losses = []
         critic_losses = []
-        
-        # 1) 找到所有 allocator 参数
-        alloc_params = []
-        for layer in self.model.layers:
-            if hasattr(layer.mlp, "allocator"):
-                alloc_params += list(layer.mlp.allocator.parameters())
-
-        if len(alloc_params) == 0:
-            print("⚠ Warning: No allocator found.")
-            return
 
         # 2) 逐 batch 计算 PPO 损失
         for batch in ppo_batches:
@@ -725,11 +715,13 @@ class MoEForCausalLM(MoEPreTrainedModel):
             critic_values = batch["critic_values"]  # [B,S,1]
             # 对应层的 allocator 和 actor-critic
             layer = self.model.layers[layer_id]
-            allocator = layer.mlp.allocator
+            # allocator = layer.mlp.allocator
             actor_critic = layer.mlp.actor_critic
 
             # 3) 通过 allocator 重新计算 log_prob_new
-            logits, probs = allocator(state)   # [B,S,K]
+            # logits, probs = allocator(state)   # [B,S,K]
+            # _, probs = actor_critic.get_action_probabilities(state)  # [B,S,K]
+            _, probs, new_critic_values = actor_critic(state)
             log_probs = torch.log(probs + 1e-8)
             
             new_log_prob = torch.gather(
@@ -773,35 +765,34 @@ class MoEForCausalLM(MoEPreTrainedModel):
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
             # loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
             allocator_loss = ppo_loss + KL_PENALTY_RATIO * kl
-            if layer_id == 23:
-                print(f"[PPO] layer={layer_id} | "
-                f"ppo_loss={ppo_loss.item():.5f} | "
-                f"kl={kl.item():.5f} | "
-                f"loss={allocator_loss.item():.5f}")
-            total_loss += allocator_loss
+            # print(f"[PPO] layer={layer_id} | "
+            # f"ppo_loss={ppo_loss.item():.5f} | "
+            # f"kl={kl.item():.5f} | "
+            # f"loss={allocator_loss.item():.5f}")
+            # total_loss += allocator_loss
 
             # 6) 计算 Actor-Critic 损失
             # 通过 actor-critic 网络重新计算动作概率和状态值
-            _, actor_probs, new_critic_values = actor_critic(state)  # [B,S,K], [B,S,K], [B,S,1]
+            # _, actor_probs, new_critic_values = actor_critic(state)  # [B,S,K], [B,S,K], [B,S,1]
             
             # 计算 Actor Loss (PPO)
-            log_probs = torch.log(actor_probs + 1e-8)
-            new_log_prob = torch.gather(
-                log_probs,
-                dim=-1,
-                index=action.unsqueeze(-1)
-            ).squeeze(-1)  # [B,S]
+            # log_probs = torch.log(actor_probs + 1e-8)
+            # new_log_prob = torch.gather(
+            #     log_probs,
+            #     dim=-1,
+            #     index=action.unsqueeze(-1)
+            # ).squeeze(-1)  # [B,S]
             
-            ratio = torch.exp(new_log_prob - old_log_prob)
+            # ratio = torch.exp(new_log_prob - old_log_prob)
             
             # 确保 advantage 和 ratio 维度一致
-            if advantage.dim() == 2 and advantage.size(1) == 1:
-                # 如果 advantage 是 [B,1]，扩展为 [B,S]
-                advantage = advantage.expand_as(ratio)
+            # if advantage.dim() == 2 and advantage.size(1) == 1:
+            #     # 如果 advantage 是 [B,1]，扩展为 [B,S]
+            #     advantage = advantage.expand_as(ratio)
             
-            unclipped = ratio * advantage      # [B,S]
-            clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            clipped = clipped_ratio * advantage
+            # unclipped = ratio * advantage      # [B,S]
+            # clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            # clipped = clipped_ratio * advantage
             
             actor_loss = -torch.mean(torch.min(unclipped, clipped))
             actor_losses.append((layer_id, actor_loss))
@@ -817,12 +808,6 @@ class MoEForCausalLM(MoEPreTrainedModel):
             critic_losses.append((layer_id, critic_loss))
 
         # 7) 反向传播和参数更新
-        # 更新 allocator 现在不需要了
-        # self.alloc_optimizer.zero_grad()
-        # total_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
-        # self.alloc_optimizer.step()
-        
         # 更新每个层的 actor 和 critic 网络
         for (layer_id, actor_loss), (_, critic_loss) in zip(actor_losses, critic_losses):
             layer = self.model.layers[layer_id]
@@ -830,16 +815,18 @@ class MoEForCausalLM(MoEPreTrainedModel):
             # 更新 actor 网络
             layer.mlp.actor_optimizer.zero_grad()
             actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(layer.mlp.actor_critic.actor.parameters(), max_norm=1.0)
             layer.mlp.actor_optimizer.step()
 
             # 更新 critic 网络
             layer.mlp.critic_optimizer.zero_grad()
             critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(layer.mlp.actor_critic.critic.parameters(), max_norm=1.0)
             layer.mlp.critic_optimizer.step()
         
         avg_actor_loss = sum(loss.item() for _, loss in actor_losses) / len(actor_losses) if actor_losses else 0.0
         avg_critic_loss = sum(loss.item() for _, loss in critic_losses) / len(critic_losses) if critic_losses else 0.0
-        print(f"[PPO Allocator] Update complete. Allocator Loss = {total_loss.item():.4f}, Actor Loss = {avg_actor_loss:.4f}, Critic Loss = {avg_critic_loss:.4f}")
+        print(f"[PPO Allocator] Update complete. Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1253,7 +1240,12 @@ class EnhancedSwitchMLP(nn.Module):
         self.num_experts  = config.num_experts
         self.max_k        = MAX_K     # 论文中的 K_max
         self.k_counter = []
-        self.actor_critic = ActorCritic(config.hidden_size, max_k=config.num_experts)
+        # actor_critic模块
+        self.actor_critic = ActorCritic(
+            hidden_size=self.hidden_size,
+            max_k=self.max_k,
+            hidden_dim=50,
+        )
         self.actor_optimizer = torch.optim.Adam(self.actor_critic.actor.parameters(), lr=ACTOR_LR)
         self.critic_optimizer = torch.optim.Adam(self.actor_critic.critic.parameters(), lr=CRITIC_LR)
         # Optimizers for actor and critic networks
@@ -1285,14 +1277,6 @@ class EnhancedSwitchMLP(nn.Module):
         #     hidden_dim=50,
         # )
         
-        # =============================
-        # Actor-Critic Network
-        # =============================
-        self.actor_critic = ActorCritic(
-            hidden_size=self.hidden_size,
-            max_k=self.max_k,
-            hidden_dim=50,
-        )
 
         # =============================
         # PPO Buffer（每层独有）
@@ -1424,13 +1408,16 @@ class ActorCritic(nn.Module):
             hidden_dim = hidden_size
             
         # Actor network (policy network)
+        intermediate_dim = hidden_size // 4
         self.actor = nn.Sequential(
-            nn.Linear(hidden_size, hidden_dim),
+            nn.Linear(hidden_size, intermediate_dim),
+            nn.GELU(),
+            nn.Linear(intermediate_dim, hidden_dim),  # 新增的中间层
             nn.GELU(),
             nn.Linear(hidden_dim, max_k)
         )
         
-        # Critic network (value network)
+        # Critic network (value network) with additional intermediate layer
         self.critic = nn.Sequential(
             nn.Linear(hidden_size, hidden_dim),
             nn.GELU(),

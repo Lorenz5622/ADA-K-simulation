@@ -164,11 +164,6 @@ class PPOTrainer(Trainer):
 
             print(f"[Reward] {reward.mean().item()} ")
 
-            # # ---- PPO 稳定 clip ----
-            # reward = torch.clamp(reward, -50, 50)
-
-
-
         # -------------------------
         # 2. 拉取 PPO buffer（来自每一层 EnhancedSwitchMLP）
         # -------------------------
