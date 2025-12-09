@@ -104,6 +104,7 @@ class WarmStartAllocatorTrainer(Trainer):
         return total_loss
 class PPOTrainer(Trainer):
     def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.reward_history = []
 
     def training_step(self, model, inputs):
@@ -347,7 +348,7 @@ def main():
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
         learning_rate=5e-4,
-        num_train_epochs=6,
+        num_train_epochs=15,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         save_strategy="steps",
