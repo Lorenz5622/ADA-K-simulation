@@ -35,8 +35,10 @@ import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 
 logger = logging.get_logger(__name__)
-KL_PENALTY_RATIO = 0.01
-ENTROPY_RATIO = 0.2
+ACTOR_LR = 5e-4
+CRITIC_LR = 5e-4
+KL_PENALTY_RATIO = 0.02
+ENTROPY_RATIO = 0.1
 _CONFIG_FOR_DOC = "LlamaConfig"
 MAX_K = 6
 test_flag = False # 为true给训练使用
@@ -155,40 +157,6 @@ class LlamaMLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-
-
-# def top_p_sampling_batched_all_sequence(logits, top_p=0.9, temperature=1.0):
-#     """
-#     Apply Top-p sampling to every element in the sequence for each item in the batch.
-#     Returns the selected token indices and the corresponding threshold indices.
-    
-#     :param logits: Logits from a language model with shape (sequence length, batch size, L)
-#     :param top_p: Cumulative probability threshold (float)
-#     :param temperature: Sampling temperature (float)
-#     :return: Tuple of tensors (selected token indices, threshold indices) for each position in each sequence in the batch
-#     """
-#     # Apply temperature
-#     logits = logits / temperature
-    
-#     # Convert logits to probabilities
-#     # probabilities = torch.softmax(logits, dim=-1)
-#     # Sort probabilities and their indices in descending order
-#     sorted_probs, sorted_indices = torch.sort(logits, descending=True)
-
-#     # Compute cumulative probabilities
-#     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-#     mask = cumulative_probs > top_p
-
-#     # Find the threshold indices
-#     threshold_indices = mask.long().argmax(dim=-1)
-#     threshold_mask = torch.nn.functional.one_hot(threshold_indices, num_classes=sorted_indices.size(-1)).bool()
-    
-#     mask = mask & ~threshold_mask
-#     sorted_indices = torch.where(mask, -1, sorted_indices)
-#     sorted_probs = torch.where(mask, 0.0, sorted_probs)   
-#     return sorted_probs, sorted_indices
                 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -687,7 +655,9 @@ class MoEForCausalLM(MoEPreTrainedModel):
         self.collected_hidden_states = []
         self.ppo_buffer = []
         self.num_layers = config.num_hidden_layers
-        self.alloc_optimizer = torch.optim.Adam(self.get_allocator_params(), lr=1e-4)
+        # self.alloc_optimizer = torch.optim.Adam(self.get_allocator_params(), lr=1e-4)
+
+        
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -715,25 +685,25 @@ class MoEForCausalLM(MoEPreTrainedModel):
                 params += list(layer.mlp.allocator.parameters())
         return params
     
+    def get_actor_critic_params(self):
+        params = []
+        for layer in self.model.layers:
+            if hasattr(layer.mlp, "actor_critic"):
+                params += list(layer.mlp.actor_critic.parameters())
+        return params
+    
     def clear_ppo_buffer(self):
         self.ppo_buffer = []
     
     def ppo_update(self, ppo_batches):
         """
-        ppo_batches: 来自 Trainer 整理的 PPO 数据
-        每个 batch item 格式:
-            {
-                "layer_id": int,
-                "state": Tensor[B,S,H],
-                "action": Tensor[B,S],
-                "old_log_prob": Tensor[B,S],
-                "advantage": Tensor[B,1],
-            }
-        只更新 allocator (W_alloc)
+        PPO 更新 allocator 和 actor-critic 网络
         """
         clip_range = 0.2
         total_loss = 0.0
-
+        actor_losses = []
+        critic_losses = []
+        
         # 1) 找到所有 allocator 参数
         alloc_params = []
         for layer in self.model.layers:
@@ -744,19 +714,19 @@ class MoEForCausalLM(MoEPreTrainedModel):
             print("⚠ Warning: No allocator found.")
             return
 
-        # optimizer = torch.optim.Adam(alloc_params, lr=1e-4)
-
         # 2) 逐 batch 计算 PPO 损失
         for batch in ppo_batches:
             layer_id = batch["layer_id"]
             state = batch["state"]             # [B,S,H]
             action = batch["action"]           # [B,S]
             old_log_prob = batch["old_log_prob"]  # [B,S]
-            advantage = batch["advantage"]     # [B,1]
+            advantage = batch["advantage"]     # [B,S] - 修正维度
             old_alloc_logits = batch["old_alloc_logits"]
-            # 对应层的 allocator
+            critic_values = batch["critic_values"]  # [B,S,1]
+            # 对应层的 allocator 和 actor-critic
             layer = self.model.layers[layer_id]
             allocator = layer.mlp.allocator
+            actor_critic = layer.mlp.actor_critic
 
             # 3) 通过 allocator 重新计算 log_prob_new
             logits, probs = allocator(state)   # [B,S,K]
@@ -772,16 +742,17 @@ class MoEForCausalLM(MoEPreTrainedModel):
             ratio = torch.exp(new_log_prob - old_log_prob)
 
             # 5) PPO clipped 对象函数
-            # unclipped = ratio * advantage      # [B,S]
-            # clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            # clipped = clipped_ratio * advantage
-
-            # loss = -torch.mean(torch.min(unclipped, clipped))
+            # 确保 advantage 和 ratio 维度一致
+            if advantage.dim() == 2 and advantage.size(1) == 1:
+                # 如果 advantage 是 [B,1]，扩展为 [B,S]
+                advantage = advantage.expand_as(ratio)
+            
             unclipped = ratio * advantage      # [B,S]
             clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
             clipped = clipped_ratio * advantage
-            ppo_loss = -torch.mean(torch.min(unclipped, clipped))
 
+            ppo_loss = -torch.mean(torch.min(unclipped, clipped))
+            
             # =====================================================
             # ★ 插入位置：在这里加入 Entropy Bonus + KL Penalty
             # =====================================================
@@ -801,22 +772,74 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
             # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
             # loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
-            loss = ppo_loss + KL_PENALTY_RATIO * kl
+            allocator_loss = ppo_loss + KL_PENALTY_RATIO * kl
             if layer_id == 23:
                 print(f"[PPO] layer={layer_id} | "
                 f"ppo_loss={ppo_loss.item():.5f} | "
                 f"kl={kl.item():.5f} | "
-                f"loss={loss.item():.5f}")
-            total_loss += loss
+                f"loss={allocator_loss.item():.5f}")
+            total_loss += allocator_loss
 
-        # 6) 反向传播
-        # print("Before:", allocator.alloc.weight[0][:10])
-        self.alloc_optimizer.zero_grad()
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
-        self.alloc_optimizer.step()
-        # print("After:", allocator.alloc.weight[0][:10])
-        print(f"[PPO Allocator] Update complete. Loss = {total_loss.item():.4f}")
+            # 6) 计算 Actor-Critic 损失
+            # 通过 actor-critic 网络重新计算动作概率和状态值
+            _, actor_probs, new_critic_values = actor_critic(state)  # [B,S,K], [B,S,K], [B,S,1]
+            
+            # 计算 Actor Loss (PPO)
+            log_probs = torch.log(actor_probs + 1e-8)
+            new_log_prob = torch.gather(
+                log_probs,
+                dim=-1,
+                index=action.unsqueeze(-1)
+            ).squeeze(-1)  # [B,S]
+            
+            ratio = torch.exp(new_log_prob - old_log_prob)
+            
+            # 确保 advantage 和 ratio 维度一致
+            if advantage.dim() == 2 and advantage.size(1) == 1:
+                # 如果 advantage 是 [B,1]，扩展为 [B,S]
+                advantage = advantage.expand_as(ratio)
+            
+            unclipped = ratio * advantage      # [B,S]
+            clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+            clipped = clipped_ratio * advantage
+            
+            actor_loss = -torch.mean(torch.min(unclipped, clipped))
+            actor_losses.append((layer_id, actor_loss))
+            
+            # 计算 Critic Loss (MSE)
+            # 确保 critic_values 和 new_critic_values 维度一致
+            if critic_values.dim() == 3 and critic_values.size(2) == 1:
+                critic_values = critic_values.squeeze(-1)  # [B,S]
+            if new_critic_values.dim() == 3 and new_critic_values.size(2) == 1:
+                new_critic_values = new_critic_values.squeeze(-1)  # [B,S]
+                
+            critic_loss = F.mse_loss(new_critic_values, critic_values)
+            critic_losses.append((layer_id, critic_loss))
+
+        # 7) 反向传播和参数更新
+        # 更新 allocator 现在不需要了
+        # self.alloc_optimizer.zero_grad()
+        # total_loss.backward()
+        # torch.nn.utils.clip_grad_norm_(alloc_params, 1.0)
+        # self.alloc_optimizer.step()
+        
+        # 更新每个层的 actor 和 critic 网络
+        for (layer_id, actor_loss), (_, critic_loss) in zip(actor_losses, critic_losses):
+            layer = self.model.layers[layer_id]
+            
+            # 更新 actor 网络
+            layer.mlp.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            layer.mlp.actor_optimizer.step()
+
+            # 更新 critic 网络
+            layer.mlp.critic_optimizer.zero_grad()
+            critic_loss.backward()
+            layer.mlp.critic_optimizer.step()
+        
+        avg_actor_loss = sum(loss.item() for _, loss in actor_losses) / len(actor_losses) if actor_losses else 0.0
+        avg_critic_loss = sum(loss.item() for _, loss in critic_losses) / len(critic_losses) if critic_losses else 0.0
+        print(f"[PPO Allocator] Update complete. Allocator Loss = {total_loss.item():.4f}, Actor Loss = {avg_actor_loss:.4f}, Critic Loss = {avg_critic_loss:.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1107,119 +1130,39 @@ class LlamaForSequenceClassification(MoEPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-# class ExpertSelector(nn.Module):
+
+# class AdaKAllocator(nn.Module):
 #     """
-#     专家选择器，用于根据hidden_states选择最佳专家
+#     Per-layer allocator W_alloc in the paper.
+#     Computes P(k | h) for dynamic top-k expert routing.
 #     """
-#     def __init__(self, config):
+#     def __init__(self, hidden_size, max_k, hidden_dim = None):
 #         super().__init__()
-#         self.hidden_size = config.hidden_size
-#         self.num_experts = config.num_experts
+#         self.max_k = max_k
+#         if hidden_dim is None:
+#             hidden_dim = hidden_size  # 默认隐藏层=H
+#         self.alloc = nn.Sequential(
+#             nn.Linear(hidden_size, hidden_dim),
+#             nn.GELU(),                    # 激活函数
+#             nn.Linear(hidden_dim, max_k)  # 输出 logits
+#         )
         
-#         # 创建路由线性层，将hidden_states映射到专家概率分布
-#         self.router = nn.Linear(self.hidden_size, self.num_experts, bias=False)
-        
-#         # 初始化权重
-#         self._init_weights()
-    
-#     def _init_weights(self):
-#         """
-#         初始化路由器权重
-#         """
-#         # 使用较小的标准差初始化，避免极端概率
-#         torch.nn.init.normal_(self.router.weight, mean=0.0, std=0.01)
-    
+
 #     def forward(self, hidden_states):
 #         """
-#         返回用于 MoE 路由的:
-#             probs: [B,S,E]
-#             sampled_k: [B,S]
-
-#         返回给 PPO 的:
-#             ppo_info = {
-#                 "state": hidden_states.detach(),
-#                 "action": sampled_k.detach(),
-#                 "log_prob": log_prob_k.detach(),
-#                 "pi_prob": probs.detach(),
-#             }
+#         hidden_states: [B,S,H]
+#         return:
+#             alloc_logits: [B,S,K]
+#             alloc_probs:  [B,S,K]
 #         """
-#         logits = self.router(hidden_states).float()
-#         logits = torch.clamp(logits, -30, 30)   # ★ 限制 logits 范围，绝不溢出
-#         probs  = torch.softmax(logits, dim=-1)
+#         logits = self.alloc(hidden_states)      # [B,S,K]
+#         logits = torch.clamp(logits, -30, 30)   # avoid softmax overflow
+#         probs = F.softmax(logits, dim=-1)
+#         probs = torch.clamp(probs, 1e-8, 1.0)
 
-#         # 非可微采样动作（保持不变）
-#         sampled_k = torch.multinomial(
-#             probs.view(-1, self.num_experts),
-#             1
-#         ).view(hidden_states.shape[:-1])             # [B,S]
-
-#         # 计算 log_prob(action)
-#         log_probs = torch.log(probs + 1e-8)
-#         log_prob_k = torch.gather(
-#             log_probs,
-#             dim=-1,
-#             index=sampled_k.unsqueeze(-1)
-#         ).squeeze(-1)                                # [B,S]
-
-#         # 生成 PPO 信息
-#         ppo_info = {
-#             "state": hidden_states.detach(),     # 状态 s
-#             "action": sampled_k.detach(),        # 动作 a
-#             "log_prob": log_prob_k.detach(),     # log π_old(a|s)
-#             "pi_prob": probs.detach(),           # π_old 概率分布（用于重要性采样）
-#         }
-
-#         return probs, sampled_k, ppo_info
-    
-#     def compute_routing_entropy(self, hidden_states):
-#         """
-#         计算路由熵，衡量专家选择的多样性
-        
-#         Args:
-#             hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
-            
-#         Returns:
-#             entropy: 标量，路由熵值
-#         """
-#         _, probs = self.forward(hidden_states)
-        
-#         # 计算熵: -sum(p * log(p))
-#         entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
-#         return torch.mean(entropy)
-
-
-class AdaKAllocator(nn.Module):
-    """
-    Per-layer allocator W_alloc in the paper.
-    Computes P(k | h) for dynamic top-k expert routing.
-    """
-    def __init__(self, hidden_size, max_k, hidden_dim = None):
-        super().__init__()
-        self.max_k = max_k
-        if hidden_dim is None:
-            hidden_dim = hidden_size  # 默认隐藏层=H
-        self.alloc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_dim),
-            nn.GELU(),                    # 激活函数
-            nn.Linear(hidden_dim, max_k)  # 输出 logits
-        )
-        
-
-    def forward(self, hidden_states):
-        """
-        hidden_states: [B,S,H]
-        return:
-            alloc_logits: [B,S,K]
-            alloc_probs:  [B,S,K]
-        """
-        logits = self.alloc(hidden_states)      # [B,S,K]
-        logits = torch.clamp(logits, -30, 30)   # avoid softmax overflow
-        probs = F.softmax(logits, dim=-1)
-        probs = torch.clamp(probs, 1e-8, 1.0)
-
-        # logits = logits.to(hidden_states.dtype)
-        # probs = probs.to(hidden_states.dtype)
-        return logits, probs
+#         # logits = logits.to(hidden_states.dtype)
+#         # probs = probs.to(hidden_states.dtype)
+#         return logits, probs
 
 def dynamic_topk_indices_and_scores(router_logits, sampled_k):
     """
@@ -1310,6 +1253,10 @@ class EnhancedSwitchMLP(nn.Module):
         self.num_experts  = config.num_experts
         self.max_k        = MAX_K     # 论文中的 K_max
         self.k_counter = []
+        self.actor_critic = ActorCritic(config.hidden_size, max_k=config.num_experts)
+        self.actor_optimizer = torch.optim.Adam(self.actor_critic.actor.parameters(), lr=ACTOR_LR)
+        self.critic_optimizer = torch.optim.Adam(self.actor_critic.critic.parameters(), lr=CRITIC_LR)
+        # Optimizers for actor and critic networks
         # =============================
         # Experts (全部冻结)
         # =============================
@@ -1332,7 +1279,16 @@ class EnhancedSwitchMLP(nn.Module):
         # Allocator (W_alloc) —— 论文新增
         # 可训练，通过 PPO 更新
         # =============================
-        self.allocator = AdaKAllocator(
+        # self.allocator = AdaKAllocator(
+        #     hidden_size=self.hidden_size,
+        #     max_k=self.max_k,
+        #     hidden_dim=50,
+        # )
+        
+        # =============================
+        # Actor-Critic Network
+        # =============================
+        self.actor_critic = ActorCritic(
             hidden_size=self.hidden_size,
             max_k=self.max_k,
             hidden_dim=50,
@@ -1366,8 +1322,6 @@ class EnhancedSwitchMLP(nn.Module):
 
         # 转回 [B,S]
         pseudo_k = pseudo_k.permute(1,0).contiguous()
-        # print(f"pseudo_k:{pseudo_k}")
-        # print(f"sorted_indices: {sorted_indices}")
         return pseudo_k
     # ==========================================================
     # Forward：论文 Ada-K routing 的完整执行流程
@@ -1386,55 +1340,23 @@ class EnhancedSwitchMLP(nn.Module):
         # 1. Router logits —— 冻结，只作为专家排序依据（论文 §3.3）
         # ------------------------------------------------------
         router_logits = self.router(hidden_states).float()  # [B,S,E]
-        # router_logits = torch.clamp(router_logits, -30, 30)
         router_logits = torch.nn.functional.softmax(router_logits, dim=2)
         if output_router_logits:
-            # print(f"EnhancedSwitchMLP hidden_states: {hidden_states}")
-            # print(f"EnhancedSwitchMLP router_logits: {router_logits}")
             return {
                 "hidden_states": hidden_states.detach(),
                 "router_logits": router_logits.detach(),
             }
         # ------------------------------------------------------
-        # 2. Allocator：预测 k 的分布（论文 §3.2）
+        # 2. 使用Actor-Critic获取动作概率和状态值
         # ------------------------------------------------------
-        alloc_logits, alloc_probs = self.allocator(hidden_states)   # [B,S,K]
-        # print("MLP training:", self.training)
-        # 采样 k （论文使用 REINFORCE/PPO）
-        # sampled_k = torch.multinomial(
-        #     alloc_probs.view(-1, self.max_k),
-        #     num_samples=1
-        # ).view(B, S)  # [B,S], 取值范围 0~max_k-1
-        sampled_k = alloc_probs.argmax(dim=-1)
+        actor_logits, actor_probs, critic_values = self.actor_critic(hidden_states)   # [B,S,K], [B,S,K], [B,S,1]
+        sampled_k = actor_probs.argmax(dim=-1)
 
 
         # 处理sampled_k
-        # sorted_probs, sorted_indices = torch.sort(router_logits, descending=True)
-        # print(f"sampled_k: {sampled_k}")
         sampled_k_action = sampled_k.clone()
         true_k = torch.clamp(sampled_k_action + 1, max=self.max_k)
         topk_indices, topk_scores = dynamic_topk_indices_and_scores(router_logits=router_logits, sampled_k=true_k,)
-        # router_B, router_S, router_E = router_logits.shape
-        # indices = torch.arange(router_E, device=router_logits.device).repeat(router_B, router_S, 1)
-        # mask = torch.ones(router_B,router_S,router_E, dtype=torch.bool, device=hidden_states.device)
-        # print(f"alloc_probs: {alloc_probs}")
-        # print(f"alloc_probs.shape: {alloc_probs.shape}")
-        # print(f"sampled_k: {sampled_k}")
-        # print(f"sample_k.shape: {sampled_k.shape}")
-        # for i in range(router_B):
-        #     for j in range(router_S):
-        #         k = sampled_k[i, j].item()
-        #         if k <= 0:
-        #             continue
-        #         topkk = min(k, 6)  # 防止越界
-        #         # top_indices = sorted_indices[i, j, :k]  # 利用已排序的 indices
-        #         top_indices = torch.topk(router_logits[i,j], topkk).indices
-        #         for k_indice in top_indices:
-        #             mask[i, j, k_indice] = False
-                # print(f"top_indices: {top_indices}")
-        
-        # topk_indices = torch.where(mask, -1, indices)
-        # topk_scores = torch.where(mask, 0.0, router_logits)
         
         if self.training:
             # 在线统计直方图，不保存所有 token 的 k
@@ -1465,8 +1387,8 @@ class EnhancedSwitchMLP(nn.Module):
         # ------------------------------------------------------
         # 6. 保存 PPO 信息 —— 分层存储
         # ------------------------------------------------------
-        logits = alloc_logits            # [B,S,K]
-        probs  = alloc_probs             # [B,S,K]
+        logits = actor_logits            # [B,S,K]
+        probs  = actor_probs             # [B,S,K]
         log_probs = torch.log(probs + 1e-8)
 
         old_log_prob = torch.gather(
@@ -1481,7 +1403,100 @@ class EnhancedSwitchMLP(nn.Module):
             "state": hidden_states.detach().float(),   # [B,S,H]
             "action": sampled_k.detach(),      # [B,S]
             "old_log_prob": old_log_prob.detach().float(),  # [B,S]
-            "old_alloc_logits": alloc_logits.detach(),
+            "old_alloc_logits": actor_logits.detach(),
+            "critic_values": critic_values.detach().float(),  # [B,S,1]
         })
         
         return output_total
+
+class ActorCritic(nn.Module):
+    """
+    Actor-Critic module for PPO training of the allocator.
+    - Actor: allocator network that outputs action probabilities
+    - Critic: value network that estimates state values
+    """
+    def __init__(self, hidden_size, max_k, hidden_dim=None):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.max_k = max_k
+        
+        if hidden_dim is None:
+            hidden_dim = hidden_size
+            
+        # Actor network (policy network)
+        self.actor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, max_k)
+        )
+        
+        # Critic network (value network)
+        self.critic = nn.Sequential(
+            nn.Linear(hidden_size, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, hidden_states):
+        """
+        hidden_states: [B,S,H]
+        returns:
+            actor_logits: [B,S,K] - logits for action probabilities
+            actor_probs: [B,S,K] - action probabilities
+            critic_values: [B,S,1] - estimated state values
+        """
+        # Actor forward pass
+        actor_logits = self.actor(hidden_states)  # [B,S,K]
+        actor_logits = torch.clamp(actor_logits, -30, 30)  # avoid softmax overflow
+        actor_probs = F.softmax(actor_logits, dim=-1)
+        actor_probs = torch.clamp(actor_probs, 1e-8, 1.0)
+        
+        # Critic forward pass
+        critic_values = self.critic(hidden_states)  # [B,S,1]
+        
+        return actor_logits, actor_probs, critic_values
+        
+    def get_action_probabilities(self, hidden_states):
+        """
+        Get action probabilities for given states
+        hidden_states: [B,S,H]
+        returns:
+            probs: [B,S,K]
+        """
+        _, probs, _ = self.forward(hidden_states)
+        return probs
+        
+    def get_state_values(self, hidden_states):
+        """
+        Get state values for given states
+        hidden_states: [B,S,H]
+        returns:
+            values: [B,S,1]
+        """
+        _, _, values = self.forward(hidden_states)
+        return values
+        
+    def evaluate_actions(self, hidden_states, actions):
+        """
+        Evaluate actions for given states
+        hidden_states: [B,S,H]
+        actions: [B,S]
+        returns:
+            log_probs: [B,S]
+            entropy: scalar
+            values: [B,S,1]
+        """
+        actor_logits, actor_probs, values = self.forward(hidden_states)
+        
+        # Calculate log probabilities
+        log_probs = torch.log(actor_probs + 1e-8)
+        action_log_probs = torch.gather(
+            log_probs,
+            dim=-1,
+            index=actions.unsqueeze(-1)
+        ).squeeze(-1)  # [B,S]
+        
+        # Calculate entropy
+        entropy = -(actor_probs * log_probs).sum(dim=-1).mean()  # scalar
+        
+        return action_log_probs, entropy, values

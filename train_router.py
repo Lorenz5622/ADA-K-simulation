@@ -25,7 +25,7 @@ def load_model(path):
     # 解冻 allocator（论文 W_alloc）
     trainable_params = []
     for name, p in model.named_parameters():
-        if "allocator" in name:     # ★ 只训练 W_alloc
+        if "actor_critic" in name:     # ★ 只训练 W_alloc
             p.requires_grad = True
             trainable_params.append(p)
 
@@ -181,7 +181,7 @@ class PPOTrainer(Trainer):
         # 3. 计算 advantage（可选：标准化）
         # -------------------------
         advantage = reward - reward.mean(dim=1, keepdim=True)
-        std = advantage.std(dim=1, keepdim=True)
+        std = advantage.std(dim=1, keepdim=True) + 1e-8  # 添加小值避免除零
         advantage = advantage / std     # [B,S]
 
 
@@ -198,14 +198,16 @@ class PPOTrainer(Trainer):
             # else:
             #     adv = torch.zeros_like(advantage)   # 其它层=0
             layer_distance = last_layer - layer_id
-            adv = advantage * (0.9 ** layer_distance)
+            # 确保 advantage 维度正确
+            adv = advantage * (0.9 ** layer_distance)  # [B,S]
             ppo_batches.append({
                 "layer_id": item["layer_id"],
                 "state": item["state"],               # [B,S,H]
                 "action": item["action"],             # [B,S]
                 "old_log_prob": item["old_log_prob"], # [B,S]
-                "advantage": adv,                     # [B,1]
+                "advantage": adv,                     # [B,S] - 修正维度
                 "old_alloc_logits": item["old_alloc_logits"],
+                "critic_values": item["critic_values"],
             })
 
 
@@ -244,7 +246,6 @@ class PPOTrainer(Trainer):
         return lm_loss
 
 
-
 # ============================================================
 # 3. 数据处理（PIQA）
 # ============================================================
@@ -280,7 +281,7 @@ def repeat_dataset(ds, times=5):
         "validation": torch.utils.data.ConcatDataset([ds["validation"]] * times)
     }
 def main():
-
+    JUMP_WARM_START = True   # 是否跳过 Warm-Start 直接 PPO 训练
     PATH_PREFIX = "/root"
     # if os.path.exists("/home/cyx"):
     #     PATH_PREFIX = "/home/cyx"
@@ -304,42 +305,43 @@ def main():
     # dataset = repeat_dataset(dataset, times=1)
     warm_ds = warm_start_dataset(dataset, ratio=0.1)
     # ====== Warm-Start 训练参数（小 lr、短 epoch） ======
-    warm_args = TrainingArguments(
-        output_dir=SAVE_PATH + "/warm",
-        learning_rate=5e-4,
-        num_train_epochs=1,
-        per_device_train_batch_size=4,
-        logging_steps=20,
-        gradient_accumulation_steps=1,
-        save_total_limit=1,
-        bf16=True,
-        ddp_find_unused_parameters=False,
-    )
-    warm_trainer = WarmStartAllocatorTrainer(
-        model=model,
-        args=warm_args,
-        train_dataset=warm_ds["train"],
-        tokenizer=tokenizer,
-    )
-    print("===== Warm Start Training =====")
-    warm_trainer.train()
-    print("===== Warm Start Done =====")
-    warm_trainer.save_model(SAVE_PATH + "/warm_model")
-    tokenizer.save_pretrained(SAVE_PATH + "/warm_model")
-    if os.path.exists(SAVE_PATH + "/warm"):
-        from pathlib import Path
-        import shutil
-        folder = Path(SAVE_PATH + "/warm")
-        shutil.rmtree(folder)
-    # =============== Trainer 设置 ===============
+    if not JUMP_WARM_START:
+        warm_args = TrainingArguments(
+            output_dir=SAVE_PATH + "/warm",
+            learning_rate=5e-4,
+            num_train_epochs=1,
+            per_device_train_batch_size=4,
+            logging_steps=20,
+            gradient_accumulation_steps=1,
+            save_total_limit=1,
+            bf16=True,
+            ddp_find_unused_parameters=False,
+        )
+        warm_trainer = WarmStartAllocatorTrainer(
+            model=model,
+            args=warm_args,
+            train_dataset=warm_ds["train"],
+            tokenizer=tokenizer,
+        )
+        print("===== Warm Start Training =====")
+        warm_trainer.train()
+        print("===== Warm Start Done =====")
+        warm_trainer.save_model(SAVE_PATH + "/warm_model")
+        tokenizer.save_pretrained(SAVE_PATH + "/warm_model")
+        if os.path.exists(SAVE_PATH + "/warm"):
+            from pathlib import Path
+            import shutil
+            folder = Path(SAVE_PATH + "/warm")
+            shutil.rmtree(folder)
+        # =============== Trainer 设置 ===============
 
-    #----------------释放模型
-    del warm_trainer
-    del model
-    torch.cuda.empty_cache()
-    import gc
-    gc.collect()
-    torch.cuda.synchronize()
+        #----------------释放模型
+        del warm_trainer
+        del model
+        torch.cuda.empty_cache()
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()
 
     print("Loading warm-start model for PPO training...")
     model = load_model(SAVE_PATH + "/warm_model")
@@ -348,7 +350,7 @@ def main():
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
         learning_rate=5e-4,
-        num_train_epochs=15,
+        num_train_epochs=16,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         save_strategy="steps",
@@ -382,3 +384,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
