@@ -33,7 +33,7 @@ from transformers.modeling_outputs import SequenceClassifierOutputWithPast
 from transformers.utils import logging, add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
 import torch.nn.functional as F
 from .configuration_moe import MoEConfig
-
+import numpy as np
 logger = logging.get_logger(__name__)
 ACTOR_LR = 1e-3
 CRITIC_LR = 1e-3
@@ -695,138 +695,75 @@ class MoEForCausalLM(MoEPreTrainedModel):
     def clear_ppo_buffer(self):
         self.ppo_buffer = []
     
-    def ppo_update(self, ppo_batches):
+    def ppo_update(self, ppo_buffer_list, clip_range=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=1.0):
         """
-        PPO 更新 allocator 和 actor-critic 网络
+        对每一层的 actor-critic 执行 PPO 更新。
+        ppo_buffer_list: 每层的数据均来自 PPOBuffer.get()
         """
-        clip_range = 0.2
-        total_loss = 0.0
-        actor_losses = []
-        critic_losses = []
+        total_actor_loss = 0.0
+        total_critic_loss = 0.0
 
-        # 2) 逐 batch 计算 PPO 损失
-        for batch in ppo_batches:
-            layer_id = batch["layer_id"]
-            state = batch["state"]             # [B,S,H]
-            action = batch["action"]           # [B,S]
-            old_log_prob = batch["old_log_prob"]  # [B,S]
-            advantage = batch["advantage"]     # [B,S] - 修正维度
-            old_alloc_logits = batch["old_alloc_logits"]
-            critic_values = batch["critic_values"]  # [B,S,1]
-            # 对应层的 allocator 和 actor-critic
+        for layer_id, ppo_batches in ppo_buffer_list.items():
+
             layer = self.model.layers[layer_id]
-            # allocator = layer.mlp.allocator
             actor_critic = layer.mlp.actor_critic
+            actor_optimizer = layer.mlp.actor_optimizer
+            critic_optimizer = layer.mlp.critic_optimizer
 
-            # 3) 通过 allocator 重新计算 log_prob_new
-            # logits, probs = allocator(state)   # [B,S,K]
-            # _, probs = actor_critic.get_action_probabilities(state)  # [B,S,K]
-            _, probs, new_critic_values = actor_critic(state)
-            log_probs = torch.log(probs + 1e-8)
-            
-            new_log_prob = torch.gather(
-                log_probs,
-                dim=-1,
-                index=action.unsqueeze(-1)
-            ).squeeze(-1)  # [B,S]
+            for batch in ppo_batches:
 
-            # 4) 计算 PPO ratio
-            ratio = torch.exp(new_log_prob - old_log_prob)
+                states      = batch["states"]       # [B, state_dim]
+                actions     = batch["actions"]      # [B]
+                old_logp    = batch["log_probs"]    # [B]
+                advantages  = batch["advantages"]   # [B]
+                returns     = batch["returns"]      # [B]
 
-            # 5) PPO clipped 对象函数
-            # 确保 advantage 和 ratio 维度一致
-            if advantage.dim() == 2 and advantage.size(1) == 1:
-                # 如果 advantage 是 [B,1]，扩展为 [B,S]
-                advantage = advantage.expand_as(ratio)
-            
-            unclipped = ratio * advantage      # [B,S]
-            clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            clipped = clipped_ratio * advantage
+                # ======================================================
+                # 1) Evaluate current policy and value function
+                # ======================================================
+                new_logp, entropy, values = actor_critic.evaluate_actions(states, actions)
+                values = values.squeeze(-1)               # [B]
 
-            ppo_loss = -torch.mean(torch.min(unclipped, clipped))
-            
-            # =====================================================
-            # ★ 插入位置：在这里加入 Entropy Bonus + KL Penalty
-            # =====================================================
+                # ======================================================
+                # 2) PPO ratio
+                # ======================================================
+                ratio = torch.exp(new_logp - old_logp)
 
-            # --- Entropy bonus -----------------------------------
-            # probs:  [B,S,K]
-            # log_probs: [B,S,K]
-            old_log_probs = torch.log_softmax(old_alloc_logits, dim=-1)
-            entropy = -(probs * log_probs).sum(dim=-1).mean()    # scalar
-            
-            # --- KL penalty (new vs old) -------------------------
-            # 需要 old_log_probs 展开成 shape [B,S,K]
-            old_log_probs_full = torch.log_softmax(old_alloc_logits, dim=-1)      # [B,S,K]
-            log_probs_new_full = torch.log(probs + 1e-8)                      # [B,S,K]
+                # clip ratio
+                surr1 = ratio * advantages
+                surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * advantages
 
-            kl = (probs * (log_probs_new_full - old_log_probs_full)).sum(dim=-1).mean()
+                actor_loss = -torch.min(surr1, surr2).mean()
 
-            # 组合 loss（entropy 惩罚为负号，因为要最大化 entropy）
-            # loss = ppo_loss - ENTROPY_RATIO * entropy + KL_PENALTY_RATIO * kl
-            allocator_loss = ppo_loss + KL_PENALTY_RATIO * kl
-            # print(f"[PPO] layer={layer_id} | "
-            # f"ppo_loss={ppo_loss.item():.5f} | "
-            # f"kl={kl.item():.5f} | "
-            # f"loss={allocator_loss.item():.5f}")
-            # total_loss += allocator_loss
+                # ======================================================
+                # 3) Critic loss (value function loss)
+                # ======================================================
+                critic_loss = (returns - values).pow(2).mean()
 
-            # 6) 计算 Actor-Critic 损失
-            # 通过 actor-critic 网络重新计算动作概率和状态值
-            # _, actor_probs, new_critic_values = actor_critic(state)  # [B,S,K], [B,S,K], [B,S,1]
-            
-            # 计算 Actor Loss (PPO)
-            # log_probs = torch.log(actor_probs + 1e-8)
-            # new_log_prob = torch.gather(
-            #     log_probs,
-            #     dim=-1,
-            #     index=action.unsqueeze(-1)
-            # ).squeeze(-1)  # [B,S]
-            
-            # ratio = torch.exp(new_log_prob - old_log_prob)
-            
-            # 确保 advantage 和 ratio 维度一致
-            # if advantage.dim() == 2 and advantage.size(1) == 1:
-            #     # 如果 advantage 是 [B,1]，扩展为 [B,S]
-            #     advantage = advantage.expand_as(ratio)
-            
-            # unclipped = ratio * advantage      # [B,S]
-            # clipped_ratio = torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
-            # clipped = clipped_ratio * advantage
-            
-            actor_loss = -torch.mean(torch.min(unclipped, clipped))
-            actor_losses.append((layer_id, actor_loss))
-            
-            # 计算 Critic Loss (MSE)
-            # 确保 critic_values 和 new_critic_values 维度一致
-            if critic_values.dim() == 3 and critic_values.size(2) == 1:
-                critic_values = critic_values.squeeze(-1)  # [B,S]
-            if new_critic_values.dim() == 3 and new_critic_values.size(2) == 1:
-                new_critic_values = new_critic_values.squeeze(-1)  # [B,S]
-                
-            critic_loss = F.mse_loss(new_critic_values, critic_values)
-            critic_losses.append((layer_id, critic_loss))
+                # ======================================================
+                # 4) 总损失（actor + critic + entropy）
+                # ======================================================
+                loss = actor_loss + vf_coef * critic_loss - ent_coef * entropy
 
-        # 7) 反向传播和参数更新
-        # 更新每个层的 actor 和 critic 网络
-        for (layer_id, actor_loss), (_, critic_loss) in zip(actor_losses, critic_losses):
-            layer = self.model.layers[layer_id]
-            
-            # 更新 actor 网络
-            layer.mlp.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(layer.mlp.actor_critic.actor.parameters(), max_norm=1.0)
-            layer.mlp.actor_optimizer.step()
+                # ======================================================
+                # 5) 优化 Actor-Critic 参数
+                # ======================================================
+                actor_optimizer.zero_grad()
+                critic_optimizer.zero_grad()
 
-            # 更新 critic 网络
-            layer.mlp.critic_optimizer.zero_grad()
-            critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(layer.mlp.actor_critic.critic.parameters(), max_norm=1.0)
-            layer.mlp.critic_optimizer.step()
-        
-        avg_actor_loss = sum(loss.item() for _, loss in actor_losses) / len(actor_losses) if actor_losses else 0.0
-        avg_critic_loss = sum(loss.item() for _, loss in critic_losses) / len(critic_losses) if critic_losses else 0.0
-        print(f"[PPO Allocator] Update complete. Actor Loss = {avg_actor_loss}, Critic Loss = {avg_critic_loss}")
+                loss.backward()
+
+                # clip grad
+                torch.nn.utils.clip_grad_norm_(actor_critic.actor.parameters(), max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(actor_critic.critic.parameters(), max_grad_norm)
+
+                actor_optimizer.step()
+                critic_optimizer.step()
+
+                total_actor_loss += actor_loss.item()
+                total_critic_loss += critic_loss.item()
+
+        print(f"[PPO] Update done: actor_loss={total_actor_loss:.4f}, critic_loss={total_critic_loss:.4f}")
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -1395,95 +1332,162 @@ class EnhancedSwitchMLP(nn.Module):
 
 class ActorCritic(nn.Module):
     """
-    Actor-Critic module for PPO training of the allocator.
-    - Actor: allocator network that outputs action probabilities
-    - Critic: value network that estimates state values
+    标准的 Actor–Critic 网络模块（适配 PPO）
+    - Actor: 输出动作分布（logits/probs）
+    - Critic: 输出状态价值 V(s)
     """
-    def __init__(self, hidden_size, max_k, hidden_dim=None):
+    def __init__(self, hidden_size, max_k, hidden_dim=256):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.max_k = max_k
-        
-        if hidden_dim is None:
-            hidden_dim = hidden_size
-            
-        # Actor network (policy network)
+        # ===== Actor =====
         intermediate_dim = hidden_size // 4
         self.actor = nn.Sequential(
             nn.Linear(hidden_size, intermediate_dim),
-            nn.GELU(),
-            nn.Linear(intermediate_dim, hidden_dim),  # 新增的中间层
-            nn.GELU(),
+            nn.Tanh(),
+            nn.Linear(intermediate_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, max_k)
         )
-        
-        # Critic network (value network) with additional intermediate layer
+        # ===== Critic =====
         self.critic = nn.Sequential(
-            nn.Linear(hidden_size, hidden_dim),
-            nn.GELU(),
+            nn.Linear(hidden_size, intermediate_dim),
+            nn.Tanh(),
+            nn.Linear(intermediate_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, 1)
         )
-        
-    def forward(self, hidden_states):
+
+    def forward(self, state):
         """
-        hidden_states: [B,S,H]
-        returns:
-            actor_logits: [B,S,K] - logits for action probabilities
-            actor_probs: [B,S,K] - action probabilities
-            critic_values: [B,S,1] - estimated state values
+        前向传播
+        Args:
+            state: [B, state_dim]
+        Returns:
+            logits: [B, action_dim]
+            probs: [B, action_dim]
+            value: [B, 1]
         """
-        # Actor forward pass
-        actor_logits = self.actor(hidden_states)  # [B,S,K]
-        actor_logits = torch.clamp(actor_logits, -30, 30)  # avoid softmax overflow
-        actor_probs = F.softmax(actor_logits, dim=-1)
-        actor_probs = torch.clamp(actor_probs, 1e-8, 1.0)
-        
-        # Critic forward pass
-        critic_values = self.critic(hidden_states)  # [B,S,1]
-        
-        return actor_logits, actor_probs, critic_values
-        
-    def get_action_probabilities(self, hidden_states):
+        logits = self.actor(state)
+        probs = F.softmax(logits, dim=-1)
+        value = self.critic(state)
+        return logits, probs, value
+
+    def act(self, state):
         """
-        Get action probabilities for given states
-        hidden_states: [B,S,H]
-        returns:
-            probs: [B,S,K]
+        动作采样：用于收集数据
+        Returns:
+            action, log_prob, value
         """
-        _, probs, _ = self.forward(hidden_states)
-        return probs
-        
-    def get_state_values(self, hidden_states):
+        _, probs, value = self.forward(state)
+        dist = torch.distributions.Categorical(probs)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        return action, log_prob, value
+
+    def evaluate_actions(self, states, actions):
         """
-        Get state values for given states
-        hidden_states: [B,S,H]
-        returns:
-            values: [B,S,1]
+        用于计算 PPO 损失的辅助函数
+        Returns:
+            log_probs, entropy, values
         """
-        _, _, values = self.forward(hidden_states)
-        return values
-        
-    def evaluate_actions(self, hidden_states, actions):
+        logits, probs, values = self.forward(states)
+        dist = torch.distributions.Categorical(probs)
+        log_probs = dist.log_prob(actions)
+        entropy = dist.entropy().mean()
+        return log_probs, entropy, values
+    
+class PPOBuffer:
+    """
+    用于存储 PPO 训练所需的 trajectory（状态、动作、log_prob、奖励、价值）
+    并在 trajectory 结束后计算：
+        - GAE 优势 A(s,a)
+        - Returns（价值目标）
+    
+    适用于 Actor–Critic + PPO 的标准实现
+    """
+    def __init__(self, state_dim, size, gamma=0.99, lam=0.95, device="cuda"):
+        self.states = torch.zeros((size, state_dim), dtype=torch.float32, device=device)
+        self.actions = torch.zeros(size, dtype=torch.long, device=device)
+        self.rewards = torch.zeros(size, dtype=torch.float32, device=device)
+        self.values = torch.zeros(size, dtype=torch.float32, device=device)
+        self.log_probs = torch.zeros(size, dtype=torch.float32, device=device)
+        self.dones = torch.zeros(size, dtype=torch.float32, device=device)
+
+        # GAE and returns
+        self.advantages = torch.zeros(size, dtype=torch.float32, device=device)
+        self.returns = torch.zeros(size, dtype=torch.float32, device=device)
+
+        self.ptr = 0       # 当前 buffer 写指针
+        self.max_size = size
+        self.gamma = gamma
+        self.lam = lam
+        self.device = device
+
+    def store(self, state, action, reward, value, log_prob, done):
         """
-        Evaluate actions for given states
-        hidden_states: [B,S,H]
-        actions: [B,S]
-        returns:
-            log_probs: [B,S]
-            entropy: scalar
-            values: [B,S,1]
+        保存单步数据到 buffer
         """
-        actor_logits, actor_probs, values = self.forward(hidden_states)
-        
-        # Calculate log probabilities
-        log_probs = torch.log(actor_probs + 1e-8)
-        action_log_probs = torch.gather(
-            log_probs,
-            dim=-1,
-            index=actions.unsqueeze(-1)
-        ).squeeze(-1)  # [B,S]
-        
-        # Calculate entropy
-        entropy = -(actor_probs * log_probs).sum(dim=-1).mean()  # scalar
-        
-        return action_log_probs, entropy, values
+        assert self.ptr < self.max_size, "PPOBuffer overflow!"
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.values[self.ptr] = value
+        self.log_probs[self.ptr] = log_prob
+        self.dones[self.ptr] = done
+        self.ptr += 1
+
+    def finish_path(self, last_value=0):
+        """
+        计算 GAE(A) 和 Returns(R)
+        最后一条 trajectory 可能未终止，因此需要 last_value
+        """
+        path_slice = slice(0, self.ptr)
+        rewards = self.rewards[path_slice]
+        values = self.values[path_slice]
+        dones = self.dones[path_slice]
+
+        # Append bootstrap value V(s_last)
+        values = torch.cat([values, torch.tensor([last_value], device=self.device)])
+
+        # ---------- 计算 GAE Advantage ----------
+        gae = 0
+        advantages = torch.zeros_like(rewards)
+
+        for t in reversed(range(self.ptr)):
+            mask = 1.0 - dones[t]  # 如果 done，则下一状态价值清零
+            delta = rewards[t] + self.gamma * values[t+1] * mask - values[t]
+            gae = delta + self.gamma * self.lam * mask * gae
+            advantages[t] = gae
+
+        # ---------- 计算 Return ----------
+        returns = advantages + self.values[path_slice]
+
+        # 保存
+        self.advantages[path_slice] = advantages
+        self.returns[path_slice] = returns
+
+        # ---------- Advantage 标准化（强烈建议） ----------
+        adv_mean = advantages.mean()
+        adv_std = advantages.std() + 1e-8
+        self.advantages[path_slice] = (advantages - adv_mean) / adv_std
+
+    def get(self, batch_size):
+        """
+        供 PPOTrainer 调用：
+        返回 mini-batches（采样时打乱顺序）
+        """
+        assert self.ptr == self.max_size, "Buffer must be full before PPO update"
+
+        idxs = np.arange(self.max_size)
+        np.random.shuffle(idxs)
+
+        for start in range(0, self.max_size, batch_size):
+            end = start + batch_size
+            batch_idx = idxs[start:end]
+
+            yield {
+                "states": self.states[batch_idx],
+                "actions": self.actions[batch_idx],
+                "log_probs": self.log_probs[batch_idx],
+                "advantages": self.advantages[batch_idx],
+                "returns": self.returns[batch_idx]
+            }

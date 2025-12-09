@@ -1,248 +1,378 @@
 import os
+import math
+import numpy as np
 import torch
 from torch import nn
+from collections import defaultdict
+
 from transformers import AutoTokenizer, Trainer, TrainingArguments
 from datasets import load_dataset
-from datasets import concatenate_datasets
 from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
+
 
 # torchrun --nproc_per_node=1 train_router.py
 # ============================================================
-# 1. 载入模型（必须是你修改后的 allocator 版本）
+# 1. 载入模型（冻结 LLM，只训练 actor_critic）
 # ============================================================
 
-
-# TODO 加一个ACTOR-CRITIC
-# 李宏毅PPO
 def load_model(path):
     print("Loading model:", path)
     model = MoEForCausalLM.from_pretrained(path)
 
     # 冻结所有参数
-    for name, p in model.named_parameters():
+    for _, p in model.named_parameters():
         p.requires_grad = False
 
-    # 解冻 allocator（论文 W_alloc）
+    # 只解冻 actor_critic（PPO / warm-start 都只改它）
     trainable_params = []
     for name, p in model.named_parameters():
-        if "actor_critic" in name:     # ★ 只训练 W_alloc
+        if "actor_critic" in name:
             p.requires_grad = True
             trainable_params.append(p)
 
-    print("Trainable allocator params:", sum(p.numel() for p in trainable_params))
+    print("Trainable actor_critic params:", sum(p.numel() for p in trainable_params))
     return model
 
 
 # ============================================================
-# 2. PPO Trainer（覆盖 HF backward）
+# 2. 工具函数：GAE（token 维度）
 # ============================================================
+
+@torch.no_grad()
+def compute_gae_tokenwise(
+    rewards: torch.Tensor,   # [B, S]
+    values: torch.Tensor,    # [B, S]
+    dones: torch.Tensor,     # [B, S]  1=terminal/pad, 0=continue
+    gamma: float,
+    lam: float,
+):
+    """
+    返回：
+      advantages: [B, S]
+      returns:    [B, S]
+    """
+    B, S = rewards.shape
+    # bootstrap 的 V(s_{S})=0（token 序列末尾）
+    values_ext = torch.cat([values, torch.zeros((B, 1), device=values.device, dtype=values.dtype)], dim=1)  # [B, S+1]
+
+    advantages = torch.zeros_like(rewards)
+    gae = torch.zeros((B,), device=rewards.device, dtype=rewards.dtype)
+
+    for t in reversed(range(S)):
+        not_done = 1.0 - dones[:, t]
+        delta = rewards[:, t] + gamma * values_ext[:, t + 1] * not_done - values_ext[:, t]
+        gae = delta + gamma * lam * not_done * gae
+        advantages[:, t] = gae
+
+    returns = advantages + values
+    return advantages, returns
+
+
+def masked_normalize(x: torch.Tensor, mask: torch.Tensor, eps: float = 1e-8):
+    """
+    x:    [N]
+    mask: [N]  bool or 0/1
+    """
+    mask = mask.float()
+    denom = mask.sum().clamp_min(1.0)
+    mean = (x * mask).sum() / denom
+    var = ((x - mean) ** 2 * mask).sum() / denom
+    std = torch.sqrt(var + eps)
+    return (x - mean) / std
+
+
+def make_minibatches(data_dict, batch_size: int, epochs: int):
+    """
+    data_dict: tensors with same first dim N
+    返回：list[batch_dict]
+    """
+    N = next(iter(data_dict.values())).shape[0]
+    batches = []
+    for _ in range(epochs):
+        idx = torch.randperm(N, device=next(iter(data_dict.values())).device)
+        for start in range(0, N, batch_size):
+            bidx = idx[start:start + batch_size]
+            batch = {k: v[bidx] for k, v in data_dict.items()}
+            batches.append(batch)
+    return batches
+
+
+# ============================================================
+# 3. Warm Start Trainer（监督：actor logits 拟合 pseudo-k）
+# ============================================================
+
 class WarmStartAllocatorTrainer(Trainer):
-    """Warm Start 阶段：对所有层的 allocator 做监督学习（由 Router Top-P 生成 pseudo-k）"""
+    """
+    Warm Start：对所有层的 actor（actor_critic.actor 输出的 logits）做监督学习
+    pseudo-k 来自冻结 router logits 的 top-p 采样。
+    """
 
     def compute_loss(self, model, inputs):
         real_model = model.module if hasattr(model, "module") else model
 
-        # ============================================================
-        # 1) 前向：让 MoEModel 返回所有 hidden_states + router_logits（所有层）
-        # ============================================================
         outputs = real_model(**inputs, output_router_logits=True)
-
-        hidden_states_all = outputs["all_hidden_states_for_warm"]     # List[L] 每层 [B,S,H]
-        router_logits_all = outputs["all_router_logits_for_warm"]     # List[L] 每层 [B,S,E]
+        hidden_states_all = outputs["all_hidden_states_for_warm"]   # List[L] each [B,S,H]
+        router_logits_all = outputs["all_router_logits_for_warm"]   # List[L] each [B,S,E]
 
         num_layers = real_model.num_layers
         total_loss = 0.0
         count = 0
 
-        # ============================================================
-        # 2) 逐层进行 warm-start 训练
-        # ============================================================
         for layer_id in range(num_layers):
+            h = hidden_states_all[layer_id]             # [B,S,H]
+            router_logits = router_logits_all[layer_id] # [B,S,E]
 
-            h = hidden_states_all[layer_id]                 # [B,S,H]
-            router_logits = router_logits_all[layer_id]     # [B,S,E]
-
-            # --------------------------------------------------------
-            # 2a. 使用你自定义 top-p 函数计算 pseudo-k
-            # --------------------------------------------------------
             pseudo_k = real_model.model.layers[layer_id].mlp.compute_pseudo_k_top_p(
-                router_logits,
-                top_p=0.9,
-                temperature=1.0,
-            )  # [B,S]
-            
+                router_logits, top_p=0.9, temperature=1.0
+            )  # [B,S] in 1..K
 
-            # --------------------------------------------------------
-            # 2b. 前向 allocator 得到 alloc_logits
-            # --------------------------------------------------------
-            alloc_logits, _ = real_model.model.layers[layer_id].mlp.allocator(h)  # [B,S,K]
-            B, S, K = alloc_logits.shape
+            # actor logits（替代原 allocator）
+            actor_logits, _, _ = real_model.model.layers[layer_id].mlp.actor_critic(h)  # [B,S,K]
+            B, S, K = actor_logits.shape
 
-            # --- 修复方案：把 pseudo_k 映射到合法标签范围 ---
-            # 1) 限制为 1…max_k
-            pseudo_k = torch.clamp(pseudo_k, 1, K)
+            # CE labels: 0..K-1
+            pseudo_k = torch.clamp(pseudo_k, 1, K) - 1
 
-            # 2) CE Loss 标签必须是 0…K-1，因此 shift 到 0-based
-            pseudo_k = pseudo_k - 1
-            # print(f"pseudo_k: {pseudo_k}")
-            # --------------------------------------------------------
-            # 2c. 计算 CrossEntropy loss
-            # --------------------------------------------------------
             loss = nn.CrossEntropyLoss()(
-                alloc_logits.reshape(B * S, K),
+                actor_logits.reshape(B * S, K),
                 pseudo_k.reshape(B * S)
             )
-
             total_loss += loss
             count += 1
 
-        # ============================================================
-        # 3) 多层 loss 平均（论文中所有层应均等权）
-        # ============================================================
-        total_loss = total_loss / count
+        return total_loss / max(count, 1)
 
-        return total_loss
+
+# ============================================================
+# 4. PPO Trainer（方案 A：禁用 HF optimizer，只走 ppo_update）
+# ============================================================
+
 class PPOTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, ppo_gamma=0.99, ppo_lam=0.95,
+                 ppo_epochs=4, ppo_minibatch_size=1024,
+                 layer_reward_decay=0.9,
+                 clip_range=0.2, vf_coef=0.5, ent_coef=0.01, max_grad_norm=1.0,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.reward_history = []
 
+        # PPO 超参
+        self.ppo_gamma = ppo_gamma
+        self.ppo_lam = ppo_lam
+        self.ppo_epochs = ppo_epochs
+        self.ppo_minibatch_size = ppo_minibatch_size
+        self.layer_reward_decay = layer_reward_decay
+
+        # 这些会透传给 model.ppo_update
+        self.clip_range = clip_range
+        self.vf_coef = vf_coef
+        self.ent_coef = ent_coef
+        self.max_grad_norm = max_grad_norm
+
+    # -------- 方案 A：禁用 HF optimizer / scheduler（但 Trainer 要求它们存在） --------
+    def create_optimizer(self):
+        # Trainer 必须有一个“非空” optimizer，否则 torch.optim 会报:
+        # ValueError: optimizer got an empty parameter list
+        #
+        # 这里给一个不会实际更新的 optimizer：
+        # - 参数：requires_grad=True（通常只有 actor_critic）
+        # - lr=0.0 & weight_decay=0.0
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if len(params) == 0:
+            # 兜底：至少塞一个参数避免 empty list（lr=0 不会更新）
+            params = [next(self.model.parameters())]
+        self.optimizer = torch.optim.AdamW(params, lr=0.0, weight_decay=0.0)
+        return self.optimizer
+
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        # HF Trainer 的训练循环会无条件调用 self.lr_scheduler.step()，所以不能返回 None。
+        class _NoOpLRScheduler:
+            def step(self, *args, **kwargs):
+                return
+            def get_last_lr(self):
+                return [0.0]
+        self.lr_scheduler = _NoOpLRScheduler()
+        return self.lr_scheduler
+
+    def optimizer_step(self, *args, **kwargs):
+        # 方案A：阻止 HF training loop 执行 optimizer.step()
+        # PPO 更新只在 real_model.ppo_update() 内部进行
+        return
+
     def training_step(self, model, inputs):
-        """
-        覆盖 Trainer 的 training_step，使 HF 不再 backward LM loss，
-        PPO 更新在 compute_loss 中执行。
-        """
+        # 覆盖 training_step：不做 HF backward（否则会对无 grad 的 loss 调 backward 报错）
         model.train()
         loss = self.compute_loss(model, inputs)
-
-        # 不执行 HF backward（论文要求冻结 LLM）
         return loss.detach()
 
     def compute_loss(self, model, inputs):
         """
-        1) 正常运行 MoE LLM forward（HF Trainer 会算 LM loss）
-        2) 从模型中拉取 allocator 的 PPO buffer
-        3) 按论文 Eq.(6) 计算 reward（最后一层 LM log-likelihood）
-        4) 组装 PPO batches
-        5) 执行 PPO 更新
-        6) 返回 LM loss（用于 HF 训练管线）
+        1) forward 产出 logits（用于 token-level reward）
+        2) 从 real_model.ppo_buffer 取轨迹
+        3) 对每层：reward -> (GAE advantages, returns)
+        4) flatten + mask -> per-layer minibatches
+        5) 调用 real_model.ppo_update(per_layer_batches, ...)
+        6) clear buffer + 记录 reward
         """
-
-        # -------------------------
-        # 0. 运行原始模型 forward
-        # -------------------------
         outputs = model(**inputs)
-        lm_loss = outputs.loss                     # HF Trainer 用这个做优化
+        lm_loss = outputs.loss
         real_model = model.module if hasattr(model, "module") else model
 
-
-        # -------------------------
-        # 1. 按论文 Eq.(6) 计算 REWARD
-        #
-        #    R = log P(x_i | x_1,...,x_{i-1})   仅最后一层 allocator 使用
-        #
-        # -------------------------
+        # ---------- 1) token-level reward ----------
         with torch.no_grad():
-            logits = outputs.logits.float()        # [B, S, V]
-            labels = inputs["labels"]              # [B, S]
+            logits = outputs.logits.float()                # [B,S,V]
+            labels = inputs["labels"]                      # [B,S]
+            attention_mask = inputs.get("attention_mask", None)  # [B,S] (0/1)
+
             B, S = labels.shape
 
-            # ---- Shift: LM 预测下一个 token ----
-            shift_logits = logits[:, :-1]          # predict labels[:,1:]
-            shift_labels = labels[:, 1:]
-            log_probs = torch.log_softmax(shift_logits, dim=-1)
-            token_logp = torch.gather(
-                log_probs, -1, shift_labels.unsqueeze(-1)
-            ).squeeze(-1)                          # [B, S-1]
+            # shift
+            shift_logits = logits[:, :-1]                  # [B,S-1,V]
+            shift_labels = labels[:, 1:]                   # [B,S-1]
 
-            # ---- mask padding tokens ----
-            token_logp = token_logp * (shift_labels != -100)
+            # safe gather：避免 -100 索引报错
+            safe_shift_labels = shift_labels.clone()
+            mask_shift = torch.ones_like(safe_shift_labels, dtype=torch.float32, device=safe_shift_labels.device)
+            if (safe_shift_labels == -100).any():
+                mask_shift = (safe_shift_labels != -100).float()
+                safe_shift_labels = torch.where(
+                    safe_shift_labels == -100,
+                    torch.zeros_like(safe_shift_labels),
+                    safe_shift_labels
+                )
+
+            log_probs = torch.log_softmax(shift_logits, dim=-1)  # [B,S-1,V]
+            token_logp = torch.gather(log_probs, -1, safe_shift_labels.unsqueeze(-1)).squeeze(-1)  # [B,S-1]
+            token_logp = token_logp * mask_shift
+
+            # 使用 attention_mask 做更稳的 mask（如有）
+            if attention_mask is not None:
+                shift_attn = attention_mask[:, 1:].float()  # [B,S-1]
+                token_logp = token_logp * shift_attn
+
             reward = torch.clamp(token_logp, -10, 10)
-            # TODO pad是否正确？
-            reward = torch.nn.functional.pad(reward, pad=(0, 1), mode="constant", value=0.0)
-            
+            reward = torch.nn.functional.pad(reward, pad=(0, 1), mode="constant", value=0.0)  # [B,S]
 
-            print(f"[Reward] {reward.mean().item()} ")
+            print(f"[Reward] reward={reward.mean().item():.6f}")
 
-        # -------------------------
-        # 2. 拉取 PPO buffer（来自每一层 EnhancedSwitchMLP）
-        # -------------------------
+        # ---------- 2) 拉取 PPO buffer ----------
         ppo_data = real_model.ppo_buffer
         if len(ppo_data) == 0:
             return lm_loss
 
+        # ---------- 3) 构造 mask / dones（token 维度） ----------
+        if "attention_mask" in inputs and inputs["attention_mask"] is not None:
+            token_mask = inputs["attention_mask"].float()  # [B,S]
+        else:
+            # fallback：labels != -100 视为有效
+            token_mask = (labels != -100).float()
 
-        # -------------------------
-        # 3. 计算 advantage（可选：标准化）
-        # -------------------------
-        advantage = reward - reward.mean(dim=1, keepdim=True)
-        std = advantage.std(dim=1, keepdim=True) + 1e-8  # 添加小值避免除零
-        advantage = advantage / std     # [B,S]
+        # dones：padding 位置 done=1；每条序列最后一个有效 token done=1
+        dones = (1.0 - token_mask).clone()  # padding done=1
+        with torch.no_grad():
+            lengths = token_mask.sum(dim=1).long().clamp_min(1)  # [B]
+            last_idx = (lengths - 1).clamp_min(0)               # [B]
+            dones[torch.arange(B, device=dones.device), last_idx] = 1.0
 
-
-        # -------------------------
-        # 4. 构建 PPO batches（论文 Eq.(6)：仅最后一层有 reward）
-        # -------------------------
-        ppo_batches = []
+        # ---------- 4) per-layer 聚合：flatten + mask ----------
+        per_layer_flat = defaultdict(lambda: defaultdict(list))
         last_layer = real_model.num_layers - 1
-        for idx, item in enumerate(ppo_data):
-            layer_id = item["layer_id"]
 
-            # if layer_id == last_layer:
-            #     adv = advantage          # 论文要求：最后一层=真实奖励
-            # else:
-            #     adv = torch.zeros_like(advantage)   # 其它层=0
+        for item in ppo_data:
+            layer_id = int(item["layer_id"])
             layer_distance = last_layer - layer_id
-            # 确保 advantage 维度正确
-            adv = advantage * (0.9 ** layer_distance)  # [B,S]
-            ppo_batches.append({
-                "layer_id": item["layer_id"],
-                "state": item["state"],               # [B,S,H]
-                "action": item["action"],             # [B,S]
-                "old_log_prob": item["old_log_prob"], # [B,S]
-                "advantage": adv,                     # [B,S] - 修正维度
-                "old_alloc_logits": item["old_alloc_logits"],
-                "critic_values": item["critic_values"],
-            })
+            layer_scale = (self.layer_reward_decay ** layer_distance)
 
+            state = item["state"]                  # [B,S,H]
+            action = item["action"].long()         # [B,S]
+            old_logp = item["old_log_prob"]        # [B,S]
+            values = item["critic_values"].squeeze(-1)  # [B,S]
 
+            # reward 分层衰减
+            rewards_layer = reward * layer_scale   # [B,S]
+            rewards_layer = rewards_layer * token_mask
 
-        # -------------------------
-        # 5. PPO 更新 allocator（只更新 W_alloc）
-        # -------------------------
-        real_model.ppo_update(ppo_batches)
+            # GAE
+            adv, ret = compute_gae_tokenwise(
+                rewards_layer, values, dones,
+                gamma=self.ppo_gamma, lam=self.ppo_lam
+            )
+
+            # flatten 并过滤无效 token
+            flat_mask = (token_mask.reshape(-1) > 0.5)
+            state_f = state.reshape(-1, state.shape[-1])[flat_mask]
+            action_f = action.reshape(-1)[flat_mask]
+            old_logp_f = old_logp.reshape(-1)[flat_mask]
+            adv_f = adv.reshape(-1)[flat_mask]
+            ret_f = ret.reshape(-1)[flat_mask]
+
+            # advantage normalize（仅对有效 token）
+            adv_f = masked_normalize(adv_f, torch.ones_like(adv_f, dtype=torch.float32))
+
+            per_layer_flat[layer_id]["states"].append(state_f)
+            per_layer_flat[layer_id]["actions"].append(action_f)
+            per_layer_flat[layer_id]["log_probs"].append(old_logp_f)
+            per_layer_flat[layer_id]["advantages"].append(adv_f)
+            per_layer_flat[layer_id]["returns"].append(ret_f)
+
+        # concat per layer
+        per_layer_batches = {}
+        for layer_id, buckets in per_layer_flat.items():
+            states = torch.cat(buckets["states"], dim=0)
+            actions = torch.cat(buckets["actions"], dim=0)
+            log_probs_old = torch.cat(buckets["log_probs"], dim=0)
+            advantages = torch.cat(buckets["advantages"], dim=0)
+            returns = torch.cat(buckets["returns"], dim=0)
+
+            data_dict = {
+                "states": states,
+                "actions": actions,
+                "log_probs": log_probs_old,
+                "advantages": advantages,
+                "returns": returns,
+            }
+
+            per_layer_batches[layer_id] = make_minibatches(
+                data_dict,
+                batch_size=self.ppo_minibatch_size,
+                epochs=self.ppo_epochs
+            )
+
+        # ---------- 5) PPO 更新（只靠 model.ppo_update 内部更新） ----------
+        real_model.ppo_update(
+            per_layer_batches,
+            clip_range=self.clip_range,
+            vf_coef=self.vf_coef,
+            ent_coef=self.ent_coef,
+            max_grad_norm=self.max_grad_norm
+        )
+
+        # 清理 buffer，避免重复用旧数据
         real_model.clear_ppo_buffer()
 
-        # 看一眼k分布
+        # 看一眼 k 分布（保持你原来的监控逻辑）
         layer_hists = []
-        for layer_id, layer in enumerate(real_model.model.layers):
+        for _, layer in enumerate(real_model.model.layers):
             if hasattr(layer.mlp, "k_hist"):
                 layer_hists.append(layer.mlp.k_hist.detach().cpu())
-
-                # reset histogram for next step
                 layer.mlp.k_hist.zero_()
 
         if len(layer_hists) > 0:
-            # sum across layers
             total_hist = torch.stack(layer_hists).sum(dim=0)
 
-            # multi-GPU sync
             import torch.distributed as dist
             if dist.is_initialized():
-                total_hist = total_hist.to('cuda')
+                total_hist = total_hist.to("cuda")
                 dist.all_reduce(total_hist, op=dist.ReduceOp.SUM)
 
             print(f"[Monitor] total k distribution = {total_hist.tolist()}")
 
-        # -------------------------
-        # 6. 返回 LM loss（不影响 PPO）
-        # -------------------------
+        # ---------- 6) 记录 reward 并返回 lm_loss（仅用于 HF pipeline 的 logging） ----------
         self.reward_history.append(reward.mean().item())
         return lm_loss
 
-
 # ============================================================
-# 3. 数据处理（PIQA）
+# 5. 数据处理（PIQA）
 # ============================================================
 
 def load_piqa(tokenizer):
@@ -253,33 +383,28 @@ def load_piqa(tokenizer):
 
     def preprocess(batch):
         text = [g + " " + s for g, s in zip(batch["goal"], batch["sol1"])]
-        out = tokenizer(text, padding="max_length",
-                        truncation=True, max_length=128)
+        out = tokenizer(text, padding="max_length", truncation=True, max_length=128)
         out["labels"] = out["input_ids"].copy()
         return out
 
     ds = ds.map(preprocess, batched=True)
-    ds.set_format(type="torch",
-                  columns=["input_ids", "attention_mask", "labels"])
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "labels"])
     return ds
+
+
 def warm_start_dataset(dataset, ratio=0.1):
     ds = dataset["train"]
     n = int(len(ds) * ratio)
     return {"train": ds.select(range(n))}
 
+
 # ============================================================
-# 4. 训练入口
+# 6. 训练入口
 # ============================================================
-def repeat_dataset(ds, times=5):
-    return {
-        "train": torch.utils.data.ConcatDataset([ds["train"]] * times),
-        "validation": torch.utils.data.ConcatDataset([ds["validation"]] * times)
-    }
+
 def main():
-    JUMP_WARM_START = True   # 是否跳过 Warm-Start 直接 PPO 训练
+    JUMP_WARM_START = False   # 是否跳过 Warm-Start 直接 PPO 训练
     PATH_PREFIX = "/root"
-    # if os.path.exists("/home/cyx"):
-    #     PATH_PREFIX = "/home/cyx"
     if os.path.exists("/data"):
         PATH_PREFIX = "/data/cyx"
 
@@ -291,14 +416,9 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 
     # =============== 加载数据 ===============
-    # ds1 = load_dataset("piqa")["train"]
-    # ds2 = load_dataset("hellaswag")["train"]
-    # ds3 = load_dataset("commonsense_qa")["train"]
-    # all_train = concatenate_datasets([ds1, ds2, ds3])
-    # dataset = {"train": all_train}
     dataset = load_piqa(tokenizer)
-    # dataset = repeat_dataset(dataset, times=1)
     warm_ds = warm_start_dataset(dataset, ratio=0.1)
+
     # ====== Warm-Start 训练参数（小 lr、短 epoch） ======
     if not JUMP_WARM_START:
         warm_args = TrainingArguments(
@@ -323,14 +443,14 @@ def main():
         print("===== Warm Start Done =====")
         warm_trainer.save_model(SAVE_PATH + "/warm_model")
         tokenizer.save_pretrained(SAVE_PATH + "/warm_model")
+
         if os.path.exists(SAVE_PATH + "/warm"):
             from pathlib import Path
             import shutil
             folder = Path(SAVE_PATH + "/warm")
             shutil.rmtree(folder)
-        # =============== Trainer 设置 ===============
 
-        #----------------释放模型
+        # 释放
         del warm_trainer
         del model
         torch.cuda.empty_cache()
@@ -341,9 +461,10 @@ def main():
     print("Loading warm-start model for PPO training...")
     model = load_model(SAVE_PATH + "/warm_model")
     tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH + "/warm_model")
-    # TODO 改大num_train_epochs
+
     training_args = TrainingArguments(
         output_dir=SAVE_PATH,
+        # learning_rate 对 PPOTrainer 无意义（HF optimizer 被禁用），保留不影响
         learning_rate=5e-4,
         num_train_epochs=16,
         per_device_train_batch_size=4,
@@ -352,8 +473,8 @@ def main():
         logging_steps=5000,
         save_total_limit=1,
         ddp_find_unused_parameters=False,
-        bf16=True,          # 强烈推荐
-        tf32=True,          # 进一步提速
+        bf16=True,
+        tf32=True,
     )
 
     # =============== PPO Trainer ===============
@@ -362,6 +483,18 @@ def main():
         args=training_args,
         train_dataset=dataset["train"],
         tokenizer=tokenizer,
+
+        # PPO 超参（可按需调）
+        ppo_gamma=0.99,
+        ppo_lam=0.95,
+        ppo_epochs=4,
+        ppo_minibatch_size=1024,
+        layer_reward_decay=0.9,
+
+        clip_range=0.2,
+        vf_coef=0.5,
+        ent_coef=0.01,
+        max_grad_norm=1.0,
     )
 
     print("Starting training...")
@@ -379,4 +512,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
