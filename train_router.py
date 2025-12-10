@@ -401,7 +401,7 @@ def warm_start_dataset(dataset, ratio=0.1):
 # ============================================================
 
 def main():
-    JUMP_WARM_START = True   # 是否跳过 Warm-Start 直接 PPO 训练
+    JUMP_WARM_START = False   # 是否跳过 Warm-Start 直接 PPO 训练
     PATH_PREFIX = "/root"
     if os.path.exists("/data"):
         PATH_PREFIX = "/data/cyx"

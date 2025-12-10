@@ -35,8 +35,8 @@ import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 import numpy as np
 logger = logging.get_logger(__name__)
-ACTOR_LR = 1e-3
-CRITIC_LR = 1e-3
+ACTOR_LR = 5e-4
+CRITIC_LR = 5e-4
 KL_PENALTY_RATIO = 0.02
 ENTROPY_RATIO = 0.1
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -1339,21 +1339,21 @@ class ActorCritic(nn.Module):
     def __init__(self, hidden_size, max_k, hidden_dim=256):
         super().__init__()
         # ===== Actor =====
-        intermediate_dim = hidden_size // 4
+        intermediate_dim = hidden_size // 10
         self.actor = nn.Sequential(
             nn.Linear(hidden_size, intermediate_dim),
-            nn.Tanh(),
-            nn.Linear(intermediate_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, max_k)
+            nn.ReLU(),
+            # nn.Linear(intermediate_dim, hidden_dim),
+            # nn.Tanh(),
+            nn.Linear(intermediate_dim, max_k)
         )
         # ===== Critic =====
         self.critic = nn.Sequential(
             nn.Linear(hidden_size, intermediate_dim),
-            nn.Tanh(),
-            nn.Linear(intermediate_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
+            nn.ReLU(),
+            # nn.Linear(intermediate_dim, hidden_dim),
+            # nn.Tanh(),
+            nn.Linear(intermediate_dim, 1)
         )
 
     def forward(self, state):
