@@ -185,13 +185,11 @@ class PPOTrainer(Trainer):
         return self.optimizer
 
     def create_scheduler(self, num_training_steps, optimizer=None):
-        # HF Trainer 的训练循环会无条件调用 self.lr_scheduler.step()，所以不能返回 None。
-        class _NoOpLRScheduler:
-            def step(self, *args, **kwargs):
-                return
-            def get_last_lr(self):
-                return [0.0]
-        self.lr_scheduler = _NoOpLRScheduler()
+        # 用 PyTorch 自带 scheduler，HF 会在保存 checkpoint 时调用 state_dict()，因此不能用自定义无 state_dict 的对象
+        # LambdaLR 自带 state_dict/load_state_dict，且 lr_lambda 恒为 1，不改变 lr
+        self.lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            self.optimizer, lr_lambda=lambda step: 1.0
+        )
         return self.lr_scheduler
 
     def optimizer_step(self, *args, **kwargs):
@@ -403,7 +401,7 @@ def warm_start_dataset(dataset, ratio=0.1):
 # ============================================================
 
 def main():
-    JUMP_WARM_START = False   # 是否跳过 Warm-Start 直接 PPO 训练
+    JUMP_WARM_START = True   # 是否跳过 Warm-Start 直接 PPO 训练
     PATH_PREFIX = "/root"
     if os.path.exists("/data"):
         PATH_PREFIX = "/data/cyx"
@@ -487,8 +485,8 @@ def main():
         # PPO 超参（可按需调）
         ppo_gamma=0.99,
         ppo_lam=0.95,
-        ppo_epochs=4,
-        ppo_minibatch_size=1024,
+        ppo_epochs=2,
+        ppo_minibatch_size=8192,
         layer_reward_decay=0.9,
 
         clip_range=0.2,
