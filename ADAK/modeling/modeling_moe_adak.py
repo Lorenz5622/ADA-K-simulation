@@ -35,8 +35,8 @@ import torch.nn.functional as F
 from .configuration_moe import MoEConfig
 import numpy as np
 logger = logging.get_logger(__name__)
-ACTOR_LR = 5e-4
-CRITIC_LR = 5e-4
+ACTOR_LR = 1e-5
+CRITIC_LR = 1e-5
 KL_PENALTY_RATIO = 0.02
 ENTROPY_RATIO = 0.1
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -765,6 +765,43 @@ class MoEForCausalLM(MoEPreTrainedModel):
 
         print(f"[PPO] Update done: actor_loss={total_actor_loss:.4f}, critic_loss={total_critic_loss:.4f}")
 
+        # 记录actor_loss和critic_loss到JSON文件
+        import json
+        import os
+        from datetime import datetime
+        
+        # 创建记录目录（如果不存在）
+        log_dir = "logs"
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            
+        # 准备要记录的数据
+        log_data = {
+            "actor_loss": total_actor_loss,
+            "critic_loss": total_critic_loss
+        }
+        
+        # 写入到JSON文件
+        log_file = os.path.join(log_dir, "ppo_losses.json")
+        
+        # 如果文件已存在，读取现有数据并追加新数据
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                try:
+                    existing_data = json.load(f)
+                    if isinstance(existing_data, list):
+                        existing_data.append(log_data)
+                    else:
+                        existing_data = [existing_data, log_data]
+                except json.JSONDecodeError:
+                    existing_data = [log_data]
+        else:
+            existing_data = [log_data]
+            
+        # 写入更新后的数据
+        with open(log_file, 'w') as f:
+            json.dump(existing_data, f, indent=4)
+
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
@@ -1053,40 +1090,6 @@ class LlamaForSequenceClassification(MoEPreTrainedModel):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
         )
-
-
-# class AdaKAllocator(nn.Module):
-#     """
-#     Per-layer allocator W_alloc in the paper.
-#     Computes P(k | h) for dynamic top-k expert routing.
-#     """
-#     def __init__(self, hidden_size, max_k, hidden_dim = None):
-#         super().__init__()
-#         self.max_k = max_k
-#         if hidden_dim is None:
-#             hidden_dim = hidden_size  # 默认隐藏层=H
-#         self.alloc = nn.Sequential(
-#             nn.Linear(hidden_size, hidden_dim),
-#             nn.GELU(),                    # 激活函数
-#             nn.Linear(hidden_dim, max_k)  # 输出 logits
-#         )
-        
-
-#     def forward(self, hidden_states):
-#         """
-#         hidden_states: [B,S,H]
-#         return:
-#             alloc_logits: [B,S,K]
-#             alloc_probs:  [B,S,K]
-#         """
-#         logits = self.alloc(hidden_states)      # [B,S,K]
-#         logits = torch.clamp(logits, -30, 30)   # avoid softmax overflow
-#         probs = F.softmax(logits, dim=-1)
-#         probs = torch.clamp(probs, 1e-8, 1.0)
-
-#         # logits = logits.to(hidden_states.dtype)
-#         # probs = probs.to(hidden_states.dtype)
-#         return logits, probs
 
 def dynamic_topk_indices_and_scores(router_logits, sampled_k):
     """

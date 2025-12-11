@@ -14,7 +14,7 @@ from ADAK.modeling.modeling_moe_adak import MoEForCausalLM
 # ============================================================
 # 1. 载入模型（冻结 LLM，只训练 actor_critic）
 # ============================================================
-
+REWARD_OFFSET = 0.0
 def load_model(path):
     print("Loading model:", path)
     model = MoEForCausalLM.from_pretrained(path)
@@ -248,10 +248,31 @@ class PPOTrainer(Trainer):
                 shift_attn = attention_mask[:, 1:].float()  # [B,S-1]
                 token_logp = token_logp * shift_attn
 
+            effective_mask = (token_logp != 0)          # 只对非零位置偏移
+            token_logp = token_logp + REWARD_OFFSET * effective_mask.float()
+
             reward = torch.clamp(token_logp, -10, 10)
             reward = torch.nn.functional.pad(reward, pad=(0, 1), mode="constant", value=0.0)  # [B,S]
 
-            print(f"[Reward] reward={reward.mean().item():.6f}")
+            # 只统计有效 token（attention_mask=1 且 reward != 0）
+            if attention_mask is not None:
+                valid_mask = (attention_mask == 1) & (reward != 0)
+            else:
+                valid_mask = (reward != 0)
+
+            if valid_mask.any():
+                mean_valid_reward = reward[valid_mask].mean().item()
+            else:
+                mean_valid_reward = 0.0
+
+            # 做一个简单滑动平均
+            self.reward_history.append(mean_valid_reward)
+            window = 100
+            smoothed = sum(self.reward_history[-window:]) / min(len(self.reward_history), window)
+
+            print(f"[Reward] mean_valid={mean_valid_reward:.4f}, smoothed_last{window}={smoothed:.4f}")
+
+            # print(f"[Reward] reward={reward}")
 
         # ---------- 2) 拉取 PPO buffer ----------
         ppo_data = real_model.ppo_buffer
@@ -403,6 +424,7 @@ def warm_start_dataset(dataset, ratio=0.1):
 def main():
     JUMP_WARM_START = False   # 是否跳过 Warm-Start 直接 PPO 训练
     PATH_PREFIX = "/root"
+    SAVE_MODEL = False
     if os.path.exists("/data"):
         PATH_PREFIX = "/data/cyx"
 
@@ -460,11 +482,14 @@ def main():
     model = load_model(SAVE_PATH + "/warm_model")
     tokenizer = AutoTokenizer.from_pretrained(SAVE_PATH + "/warm_model")
 
+    form_train_model_path = SAVE_PATH + "/warm_model"
+    if JUMP_WARM_START:
+        form_train_model_path = MODEL_PATH
     training_args = TrainingArguments(
-        output_dir=SAVE_PATH,
+        output_dir=form_train_model_path,
         # learning_rate 对 PPOTrainer 无意义（HF optimizer 被禁用），保留不影响
         learning_rate=5e-4,
-        num_train_epochs=16,
+        num_train_epochs=1,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=4,
         save_strategy="steps",
@@ -486,7 +511,7 @@ def main():
         ppo_gamma=0.99,
         ppo_lam=0.95,
         ppo_epochs=2,
-        ppo_minibatch_size=8192,
+        ppo_minibatch_size=4096,
         layer_reward_decay=0.9,
 
         clip_range=0.2,
@@ -499,8 +524,9 @@ def main():
     trainer.train()
 
     print("Saving model...")
-    model.save_pretrained(SAVE_PATH)
-    tokenizer.save_pretrained(SAVE_PATH)
+    if SAVE_MODEL:
+        model.save_pretrained(SAVE_PATH)
+        tokenizer.save_pretrained(SAVE_PATH)
     print("Done.")
 
     import json
